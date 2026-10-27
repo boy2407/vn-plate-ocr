@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vn-plate-ocr"
+version = "0.1.0"
+description = "YOLOv8n and custom-trained CCT OCR for Vietnamese license plates"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "ultralytics>=8.3,<9",
+    "fast-plate-ocr[onnx]==1.1.0",
+    "PyYAML>=6,<7",
+]
+
+[project.optional-dependencies]
+train = ["fast-plate-ocr[train]==1.1.0"]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+vn-plate-ocr = "custom_alpr.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["custom_alpr"]
+
+[tool.setuptools.package-data]
+custom_alpr = ["configs/*.yaml", "configs/LICENSE.fast-plate-ocr"]
+
+[tool.pytest.ini_options]
+testpaths = ["custom_alpr/tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "N", "UP", "B", "SIM", "ARG", "PL", "PERF", "RUF", "PD"]
+ignore = ["N812", "PLR2004", "PD011"]
+
+[tool.ruff.lint.pylint]
+max-args = 8

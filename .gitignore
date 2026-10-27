@@ -1,0 +1,15 @@
+.venv*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.DS_Store
+custom_alpr/data/
+custom_alpr/outputs/
+*.pt
+*.onnx
+*.keras
+.env

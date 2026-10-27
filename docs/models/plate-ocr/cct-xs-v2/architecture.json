@@ -1,0 +1,69 @@
+{
+ "kind": "cnn",
+ "title": "Plate OCR — CCT-XS v2 (main path)",
+ "input": "3×64×128",
+ "output": "10 chars",
+ "blocks": [
+  {
+   "type": "conv",
+   "label": "Conv 32",
+   "out": "32×62×126",
+   "stage": "tok-1"
+  },
+  {
+   "type": "pool",
+   "label": "BlurPool",
+   "out": "32×31×63",
+   "stage": "tok-1"
+  },
+  {
+   "type": "conv",
+   "label": "Conv 48,64",
+   "out": "64×27×59",
+   "stage": "tok-2"
+  },
+  {
+   "type": "pool",
+   "label": "BlurPool",
+   "out": "64×14×30",
+   "stage": "tok-2"
+  },
+  {
+   "type": "conv",
+   "label": "Conv 80,96",
+   "out": "96×10×26",
+   "stage": "tok-3"
+  },
+  {
+   "type": "embed",
+   "label": "Patch",
+   "out": "65×96",
+   "dropout": 0.15
+  },
+  {
+   "type": "attn",
+   "label": "Enc×3",
+   "out": "65×96"
+  },
+  {
+   "type": "attn",
+   "label": "Reduce",
+   "out": "10×96"
+  },
+  {
+   "type": "attn",
+   "label": "Post×3",
+   "out": "10×96"
+  },
+  {
+   "type": "fc",
+   "label": "Dense",
+   "out": "10×37",
+   "dropout": 0.15
+  }
+ ],
+ "training": {
+  "dropout": "patch MLP 0.15, attn 0.1, MLP 0.15, head 0.15, stoch. depth 0.1",
+  "bias": "on in tokenizer conv"
+ }
+}
