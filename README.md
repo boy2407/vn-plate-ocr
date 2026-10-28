@@ -1,6 +1,9 @@
 # YOLOv8n + OCR biển số tự huấn luyện
 
-Pipeline: **ảnh → YOLOv8n → cắt biển số → CCT-XS v2 → chuỗi ký tự**.
+Trạng thái kiến trúc tự xây, dữ liệu, augmentation và phần còn thiếu được ghi tại
+[`docs/models/plate-ocr/project-status.md`](docs/models/plate-ocr/project-status.md).
+
+Pipeline hiện tại: **ảnh → YOLOv8n → cắt biển số → CCT-XS v2 → chuỗi ký tự**.
 
 YOLOv8n fine-tune từ trọng số COCO cho một lớp `license_plate`. OCR dùng implementation
 CCT-XS v2 của `fast-plate-ocr==1.1.0`, khởi tạo mới và train bằng nhãn của bạn; không tải
@@ -99,6 +102,28 @@ YOLO tự tải `yolov8n.pt` ở lần đầu. Đây là trọng số khởi t�
 Nếu hết VRAM, giảm batch. Có thể dùng `--device cpu` hoặc `--device mps` trên Mac.
 
 ## 4. Train OCR và export
+
+### Mạng OCR tự xây (baseline mới)
+
+Repo có thêm `custom_alpr/custom_ocr.py` với hai mạng tự viết. `PlateOCR` là baseline CNN +
+Transformer + CTC. `PlateOCR2D` là hướng nhận diện biển một/hai dòng không cần nhãn layout:
+residual CNN + BlurPool tạo feature map `256×4×32`; encoder giữ lưới 2D thành 128 token
+có vị trí hàng/cột; autoregressive Transformer decoder sinh chuỗi từ transcription đầy
+đủ. Alphabet hỗ trợ số, A-Z và `Đ`. Đây mới là kiến trúc; chưa có vòng lặp train riêng và
+chưa thay pipeline CCT hiện tại.
+
+Với `PlateOCR2D`, ảnh RGB chuẩn hoá vào dạng `[B,3,64,128]`. Dùng `encode_target` để biến
+transcription thành BOS + ký tự + EOS; pad batch bằng `PAD_INDEX`; đầu vào teacher forcing
+là `target_ids[:, :-1]`; loss là `sequence_loss(logits, target_ids)`. `generate(images)`
+giải mã chuỗi trực tiếp. Cần viết Dataset/collate, vòng lặp train/validation và lưu
+checkpoint trước khi mô hình có thể huấn luyện thực tế.
+
+[Xem note chi tiết về query, 4 attention head và Dense của Decoder](docs/models/plate-ocr/layout-free-2d-transformer/decoder-flow.md).
+
+`custom_alpr/augment.py` cung cấp `random_motion_blur(image, rng)` cho crop RGB uint8 ở
+nhánh train; mặc định áp dụng xác suất 0.2 với kernel directional 3/5/7 pixel. Không gọi
+augmentation này trên validation hay inference. Vì Dataset/train loop custom chưa có,
+hàm hiện chưa tự chạy trong pipeline.
 
 Sau khi hoàn tất nhãn train và validation:
 

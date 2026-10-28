@@ -1,0 +1,9 @@
+source,transcription,opencv_hue_offset,equivalent_degrees,output
+type1_314.jpg,51A 35600,-8,-16,type1_314__h-8.png
+type1_314.jpg,51A 35600,8,16,type1_314__h+8.png
+type3_480.jpg,60LD 04247,-8,-16,type3_480__h-8.png
+type3_480.jpg,60LD 04247,8,16,type3_480__h+8.png
+type4_814.jpg,60A 00480,-8,-16,type4_814__h-8.png
+type4_814.jpg,60A 00480,8,16,type4_814__h+8.png
+type5_304.jpg,BH 5388,-8,-16,type5_304__h-8.png
+type5_304.jpg,BH 5388,8,16,type5_304__h+8.png
