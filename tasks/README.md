@@ -53,7 +53,7 @@
 | 045 | Send only the best YOLO box to OCR | done | Codex | 2026-10-28 |
 | 046 | Stream actual clip inference in real time | done | Codex | 2026-10-28 |
 | 047 | Compare global CCT-XS v2 on OCR test split | done | Codex | 2026-10-28 |
-| 066 | Make CCT comparison reproducible and push results | doing | Codex | 2026-10-28 |
+| 066 | Make CCT comparison reproducible and push results | done | Codex | 2026-10-28 |
 | 048 | Optional denoise and sharpening before OCR | done | Codex | 2026-10-28 |
 | 049 | Group repeated plate observations across video frames | done | Codex | 2026-10-28 |
 | 050 | Diagnose YOLO quality and compare inference resolutions | done | Codex | 2026-10-28 |
