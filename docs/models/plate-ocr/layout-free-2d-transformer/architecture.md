@@ -24,3 +24,5 @@ Training labels are full plate strings. Encode each as `BOS + characters + EOS`,
 Current interface in `custom_alpr/custom_ocr.py`: `PlateOCR2D(images, decoder_input_ids)` returns `[batch, steps, vocabulary]`; `generate(images)` emits strings. A dataset loader, training loop, checkpoint management, and pipeline adapter are not implemented yet.
 
 See [decoder flow](decoder-flow.md) for the query/key/value shapes, four attention heads, Dense classifier, and training behavior.
+
+See [Transformer stages](transformer-stages.md) for a focused diagram of the three encoder layers and two autoregressive decoder layers.

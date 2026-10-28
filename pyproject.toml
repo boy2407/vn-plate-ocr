@@ -16,6 +16,8 @@ dependencies = [
 
 [project.optional-dependencies]
 train = ["fast-plate-ocr[train]==1.1.0"]
+custom-ocr-train = ["torch>=2.6", "Pillow>=10"]
+web = ["flask>=3,<4", "torch>=2.6", "Pillow>=10"]
 dev = ["pytest", "ruff"]
 
 [project.scripts]
@@ -25,7 +27,7 @@ vn-plate-ocr = "custom_alpr.__main__:main"
 include = ["custom_alpr"]
 
 [tool.setuptools.package-data]
-custom_alpr = ["configs/*.yaml", "configs/LICENSE.fast-plate-ocr"]
+custom_alpr = ["configs/*.yaml", "configs/LICENSE.fast-plate-ocr", "web/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["custom_alpr/tests"]

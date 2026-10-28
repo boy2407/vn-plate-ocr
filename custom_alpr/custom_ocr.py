@@ -264,6 +264,210 @@ class PlateOCR2D(nn.Module):
         return decode_targets(generated)
 
 
+class PermutationDecoderLayer(nn.Module):
+    """Pre-norm layer: position queries attend to context tokens, then to the image."""
+
+    def __init__(self, model_dim: int, attention_heads: int, dropout: float):
+        super().__init__()
+        self.query_norm = nn.LayerNorm(model_dim)
+        self.context_norm = nn.LayerNorm(model_dim)
+        self.context_attention = nn.MultiheadAttention(
+            model_dim, attention_heads, dropout=dropout, batch_first=True
+        )
+        self.memory_norm = nn.LayerNorm(model_dim)
+        self.memory_attention = nn.MultiheadAttention(
+            model_dim, attention_heads, dropout=dropout, batch_first=True
+        )
+        self.feedforward_norm = nn.LayerNorm(model_dim)
+        self.feedforward = nn.Sequential(
+            nn.Linear(model_dim, model_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(model_dim * 4, model_dim),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        queries: Tensor,
+        context: Tensor,
+        memory: Tensor,
+        attention_mask: Tensor,
+        context_padding_mask: Tensor,
+    ) -> Tensor:
+        context = self.context_norm(context)
+        attended, _ = self.context_attention(
+            self.query_norm(queries),
+            context,
+            context,
+            attn_mask=attention_mask,
+            key_padding_mask=context_padding_mask,
+            need_weights=False,
+        )
+        queries = queries + self.dropout(attended)
+        normalized = self.memory_norm(queries)
+        attended, _ = self.memory_attention(normalized, memory, memory, need_weights=False)
+        queries = queries + self.dropout(attended)
+        return queries + self.dropout(self.feedforward(self.feedforward_norm(queries)))
+
+
+class PlateOCRParseq(PlateOCR2D):
+    """PlateOCR2D encoder with a PARSeq-style permutation language-model decoder.
+
+    Each output position is a learned position query; characters appear only as
+    context keys/values. Training averages the loss over several reading orders,
+    each expressed as an attention mask, so the decoder cannot rely on the
+    previous character alone. Inference decodes left to right, then refines every
+    position once while it sees all other predicted characters (cloze mask).
+    """
+
+    def __init__(
+        self,
+        *args,
+        permutations: int = 6,
+        refine_iterations: int = 1,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        if permutations < 1 or permutations % 2:
+            raise ValueError("permutations must be a positive even number (orders + flips)")
+        self.permutations = permutations
+        self.refine_iterations = refine_iterations
+        model_dim = self.token_embedding.embedding_dim
+        attention_heads = self.decoder.layers[0].self_attn.num_heads
+        dropout = self.decoder.layers[0].dropout.p
+        layer_count = len(self.decoder.layers)
+        del self.decoder
+        self.position_queries = nn.Parameter(torch.zeros(1, self.max_output_length, model_dim))
+        self.decoder_layers = nn.ModuleList(
+            PermutationDecoderLayer(model_dim, attention_heads, dropout) for _ in range(layer_count)
+        )
+        nn.init.trunc_normal_(self.position_queries, std=0.02)
+
+    def decode_positions(
+        self, memory: Tensor, context_ids: Tensor, attention_mask: Tensor
+    ) -> Tensor:
+        """Logits for every position query given context IDs ``[BOS, t0, t1, ...]``."""
+        length = context_ids.shape[1]
+        if length > self.max_output_length:
+            raise ValueError(f"Decoder input exceeds {self.max_output_length} tokens")
+        context = self.token_embedding(context_ids) + self.decoder_position[:, :length]
+        queries = self.position_queries[:, :length].expand(context_ids.shape[0], -1, -1)
+        padding = context_ids.eq(PAD_INDEX)
+        for layer in self.decoder_layers:
+            queries = layer(queries, context, memory, attention_mask, padding)
+        return self.classifier(self.decoder_norm(queries))
+
+    def decode(self, memory: Tensor, decoder_input_ids: Tensor) -> Tensor:
+        """Left-to-right (causal) logits, matching the PlateOCR2D teacher-forced API."""
+        mask = permutation_attention_mask(
+            torch.arange(decoder_input_ids.shape[1], device=decoder_input_ids.device)
+        )
+        return self.decode_positions(memory, decoder_input_ids, mask)
+
+    def permutation_loss(
+        self,
+        images: Tensor,
+        decoder_input_ids: Tensor,
+        target_ids: Tensor,
+        label_smoothing: float = 0.0,
+    ) -> Tensor:
+        """Mean cross-entropy over left-to-right, right-to-left, and random orders."""
+        memory = self.encode(images)
+        length = decoder_input_ids.shape[1]
+        device = decoder_input_ids.device
+        orders = [torch.arange(length, device=device)]
+        while len(orders) < self.permutations // 2:
+            orders.append(torch.randperm(length, device=device))
+        orders += [order.flip(0) for order in orders]
+        losses = [
+            sequence_loss(
+                self.decode_positions(memory, decoder_input_ids, permutation_attention_mask(o)),
+                target_ids,
+                label_smoothing,
+            )
+            for o in orders
+        ]
+        return torch.stack(losses).mean()
+
+    @torch.inference_mode()
+    def generate_with_confidence(
+        self, images: Tensor, max_output_length: int | None = None
+    ) -> tuple[list[str], list[float]]:
+        """Decode left to right, refine with a cloze mask, and score each plate.
+
+        Confidence is the geometric mean probability of the final character tokens
+        (EOS excluded), the same definition used for PlateOCR2D.
+        """
+        max_length = max_output_length or self.max_output_length
+        if max_length > self.max_output_length:
+            raise ValueError(f"max_output_length cannot exceed {self.max_output_length}")
+        steps = max_length - 1
+        memory = self.encode(images)
+        batch_size, device = images.shape[0], images.device
+        context = torch.full((batch_size, steps), PAD_INDEX, dtype=torch.long, device=device)
+        context[:, 0] = BOS_INDEX
+        causal = permutation_attention_mask(torch.arange(steps, device=device))
+        logits = torch.zeros(batch_size, steps, self.classifier.out_features, device=device)
+        for step in range(steps):
+            logits[:, step] = self.decode_positions(memory, context, causal)[:, step]
+            if step + 1 < steps:
+                context[:, step + 1] = logits[:, step].argmax(dim=-1)
+            if logits[:, : step + 1].argmax(dim=-1).eq(EOS_INDEX).any(dim=1).all():
+                break
+        cloze = cloze_attention_mask(steps, device)
+        for _ in range(self.refine_iterations):
+            context = context_from_prediction(logits.argmax(dim=-1))
+            logits = self.decode_positions(memory, context, cloze)
+        probabilities, predicted = logits.softmax(dim=-1).max(dim=-1)
+        ended = predicted.eq(EOS_INDEX).cumsum(dim=1) > 0
+        characters = (~ended) & (predicted >= 3)
+        log_sum = torch.where(characters, probabilities.clamp_min(1e-12).log(), 0.0).sum(dim=1)
+        counts = characters.sum(dim=1)
+        scores = torch.where(counts > 0, (log_sum / counts.clamp_min(1)).exp(), 0.0)
+        return decode_targets(predicted), scores.detach().cpu().tolist()
+
+    def generate(self, images: Tensor, max_output_length: int | None = None) -> list[str]:
+        return self.generate_with_confidence(images, max_output_length)[0]
+
+
+def context_from_prediction(predicted: Tensor) -> Tensor:
+    """Build ``[BOS, t0, t1, ...]`` context, padding every slot after the first EOS."""
+    ended = predicted.eq(EOS_INDEX).cumsum(dim=1) > 0
+    context = torch.cat((torch.full_like(predicted[:, :1], BOS_INDEX), predicted[:, :-1]), dim=1)
+    after_eos = torch.cat((torch.zeros_like(ended[:, :2]), ended[:, :-2]), dim=1)
+    return context.masked_fill(after_eos[:, : context.shape[1]], PAD_INDEX)
+
+
+def permutation_attention_mask(order: Tensor) -> Tensor:
+    """Boolean mask (True = blocked) for position queries over ``[BOS, t0, t1, ...]``.
+
+    Query ``i`` predicts token ``t_i``. It always sees BOS (slot 0) and sees slot
+    ``k + 1`` (token ``t_k``) only when ``t_k`` comes before ``t_i`` in ``order``.
+    """
+    length = order.shape[0]
+    rank = torch.empty_like(order)
+    rank[order] = torch.arange(length, device=order.device)
+    visible = torch.zeros(length, length, dtype=torch.bool, device=order.device)
+    visible[:, 0] = True
+    visible[:, 1:] = rank[None, : length - 1] < rank[:, None]
+    return ~visible
+
+
+def cloze_attention_mask(length: int, device: torch.device) -> Tensor:
+    """Each query sees BOS and every other token, but not its own (slot ``i + 1``)."""
+    visible = torch.ones(length, length, dtype=torch.bool, device=device)
+    index = torch.arange(length - 1, device=device)
+    visible[index, index + 1] = False
+    return ~visible
+
+
+def build_model(checkpoint: dict) -> PlateOCR2D:
+    """Rebuild the model class recorded in a training checkpoint."""
+    model_class = PlateOCRParseq if checkpoint.get("decoder") == "parseq" else PlateOCR2D
+    return model_class(**checkpoint["model_config"])
+
+
 def normalize_text(text: str) -> str:
     """Remove plate-label separators while preserving meaningful characters."""
     return "".join(
@@ -289,11 +493,14 @@ def encode_target(text: str) -> list[int]:
     return [BOS_INDEX, *(DECODER_CHAR_TO_INDEX[character] for character in normalized), EOS_INDEX]
 
 
-def sequence_loss(logits: Tensor, target_ids: Tensor) -> Tensor:
+def sequence_loss(logits: Tensor, target_ids: Tensor, label_smoothing: float = 0.0) -> Tensor:
     """Teacher-forced cross-entropy; target IDs include BOS, text, EOS, and PAD."""
     expected = target_ids[:, 1:]
     return nn.functional.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]), expected.reshape(-1), ignore_index=PAD_INDEX
+        logits.reshape(-1, logits.shape[-1]),
+        expected.reshape(-1),
+        ignore_index=PAD_INDEX,
+        label_smoothing=label_smoothing,
     )
 
 
