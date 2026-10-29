@@ -72,6 +72,11 @@ def parse_args() -> argparse.Namespace:
         help="shrink half of the crops to 8-24 px high (default: 30%% to 12-32 px)",
     )
     parser.add_argument(
+        "--compression-augment",
+        action="store_true",
+        help="also pass small copies through JPEG (p=0.3) or real H.264 with motion (p=0.15)",
+    )
+    parser.add_argument(
         "--balance-rare-letters",
         action="store_true",
         help="repeat plates with rare letters within each epoch (every plate still once)",
@@ -250,6 +255,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         rotate=args.rotate_augment,
         strong_downscale=args.strong_downscale,
         view_tilt=args.view_tilt,
+        compression=args.compression_augment,
         seed=args.seed,
     )
     val_dataset = PlateOCRDataset(args.val, seed=args.seed)
@@ -398,6 +404,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
                         "rotate_augment": args.rotate_augment,
                         "strong_downscale": args.strong_downscale,
                         "view_tilt": args.view_tilt,
+                        "compression_augment": args.compression_augment,
                         "balance_rare_letters": args.balance_rare_letters,
                         "model_config": {
                             "max_output_length": args.max_output_length,

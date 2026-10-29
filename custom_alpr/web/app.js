@@ -1,41 +1,17 @@
 'use strict';
 const $ = id => document.getElementById(id);
-let selectedFile = null, previewURL = null, currentJob = null, page = 0, total = 0, activeItem = null, currentView = 'plates';
-const fileInput = $('file'), mediaArea = $('media-area');
+let currentJob = null, page = 0, total = 0, activeItem = null, currentView = 'plates';
+const mediaArea = $('media-area');
 function error(message) { $('error').textContent = message; $('error').hidden = !message; }
-function selectFile(file) {
-  if (!file) return;
-  selectedFile = null;
-  if (!/\.(jpe?g|png|webp|mp4)$/i.test(file.name)) return error('Hãy chọn JPG, PNG, WebP hoặc MP4.');
-  if (file.size > 300 * 1024 * 1024) return error('Tệp vượt quá giới hạn 300 MB.');
-  selectedFile = file; error('');
-  currentJob = null;
-  history.replaceState(null, '', '/');
-  $('gallery').replaceChildren(); $('empty-gallery').hidden = false;
-  $('empty-gallery').textContent = 'Bấm Nhận diện biển số để tạo kết quả cho tệp vừa chọn.';
-  $('count').textContent = '0'; $('pagination').hidden = true;
-  $('download-csv').hidden = true; $('process').hidden = true; $('live-inspector').hidden = true; $('live-badge').hidden = true; $('live-metrics').hidden = true;
-  $('file-info').hidden = false; $('file-info').textContent = `${file.name} · ${(file.size / 1024 / 1024).toFixed(2)} MB`;
-  if (previewURL) URL.revokeObjectURL(previewURL);
-  previewURL = URL.createObjectURL(file);
-  showMedia(previewURL, /\.mp4$/i.test(file.name) ? 'video' : 'image');
-  $('media-caption').textContent = file.name;
-  $('summary').textContent = 'Bản gốc · chưa nhận diện';
-  $('download-media').hidden = true;
-}
 function showMedia(url, kind) {
   const media = document.createElement(kind === 'video' ? 'video' : 'img');
   media.src = url;
   if (kind === 'video') { media.controls = true; media.playsInline = true; media.preload = 'metadata'; }
-  else media.alt = 'Ảnh tải lên hoặc kết quả nhận diện';
+  else media.alt = 'Frame đang được nhận diện';
   mediaArea.replaceChildren(media);
 }
-fileInput.addEventListener('change', () => selectFile(fileInput.files[0]));
 $('confidence').addEventListener('input', e => $('conf-value').textContent = Number(e.target.value).toFixed(2));
-for (const event of ['dragenter', 'dragover']) $('dropzone').addEventListener(event, e => { e.preventDefault(); $('dropzone').classList.add('dragover'); });
-for (const event of ['dragleave', 'drop']) $('dropzone').addEventListener(event, e => { e.preventDefault(); $('dropzone').classList.remove('dragover'); });
-$('dropzone').addEventListener('drop', e => { if (!fileInput.disabled) { fileInput.required = false; selectFile(e.dataTransfer.files[0]); } });
-function busy(state) { for (const id of ['submit','sample','file','confidence','denoise','sharpen','padding','rectify','image-size','result-view','selection']) $(id).disabled = state; }
+function busy(state) { for (const id of ['submit','confidence','denoise','sharpen','padding','rectify','image-size','min-height','youtube-url','youtube-seconds','result-view']) $(id).disabled = state; }
 async function jsonFetch(url, options) {
   const response = await fetch(url, options);
   const data = await response.json();
@@ -43,27 +19,23 @@ async function jsonFetch(url, options) {
   return data;
 }
 async function start(url, body) {
-  busy(true); error(''); $('process').hidden = false; $('phase').textContent = 'Đang tải lên'; $('percent').textContent = ''; $('progress').removeAttribute('value'); $('progress-detail').textContent = 'Giữ trang mở trong lúc xử lý.';
+  busy(true); error(''); $('process').hidden = false; $('phase').textContent = 'Đang gửi yêu cầu'; $('percent').textContent = ''; $('progress').removeAttribute('value'); $('progress-detail').textContent = 'Giữ trang mở trong lúc xử lý.';
   $('gallery').replaceChildren(); $('empty-gallery').hidden = false; $('empty-gallery').textContent = 'Đang chuẩn bị kết quả đối chiếu…'; $('count').textContent = '0'; $('pagination').hidden = true; $('download-csv').hidden = true; $('download-media').hidden = true; $('live-inspector').hidden = true; $('live-badge').hidden = true; $('live-metrics').hidden = true;
   try {
     const {id} = await jsonFetch(url, {method: 'POST', body});
     currentJob = id;
     history.replaceState(null, '', `/?job=${id}`);
     await poll(id);
-  } catch (e) { error(e.message); $('phase').textContent = 'Chưa hoàn tất'; $('progress').value = 0; $('empty-gallery').textContent = 'Chưa có kết quả. Hãy kiểm tra tệp và thử lại.'; }
+  } catch (e) { error(e.message); $('phase').textContent = 'Chưa hoàn tất'; $('progress').value = 0; $('empty-gallery').textContent = 'Chưa có kết quả. Hãy kiểm tra link và thử lại.'; }
   finally { busy(false); $('live-badge').hidden = true; }
 }
 function processingForm() {
   const form = new FormData();
   form.append('confidence', $('confidence').value);
   form.append('image_size', $('image-size').value);
-  form.append('selection', $('selection').value);
+  form.append('min_height', $('min-height').value);
   for (const name of ['denoise', 'sharpen', 'padding', 'rectify']) form.append(name, $(name).checked ? '1' : '0');
   return form;
-}
-function ocrLabel(item) { return item.mean_ocr_confidence == null ? 'OCR' : 'OCR TB'; }
-function averageLabel(item) {
-  return item.mean_ocr_confidence == null ? '' : ` · TB ${item.averaged_frames}/${item.window_frames} frame cùng chuỗi · Crop đại diện ${(item.representative_ocr_confidence*100).toFixed(1)}%`;
 }
 function processingLabel(options = {}) {
   const enabled = [];
@@ -72,8 +44,18 @@ function processingLabel(options = {}) {
   if (options.sharpen) enabled.push('tăng nét');
   return enabled.length ? enabled.join(' + ') : 'không lọc ảnh';
 }
-$('upload-form').addEventListener('submit', e => { e.preventDefault(); if (!selectedFile) return error('Hãy chọn ảnh hoặc MP4.'); const form = processingForm(); form.append('file', selectedFile); start('/api/jobs', form); });
-$('sample').addEventListener('click', () => start('/api/sample', processingForm()));
+$('youtube-form').addEventListener('submit', e => {
+  e.preventDefault();
+  const url = $('youtube-url').value.trim();
+  if (!url) return error('Hãy dán link YouTube.');
+  const form = processingForm(); form.append('url', url); form.append('max_seconds', $('youtube-seconds').value);
+  start('/api/youtube', form);
+});
+$('stop').addEventListener('click', async () => {
+  if (!currentJob) return;
+  $('stop').disabled = true;
+  try { await jsonFetch(`/api/jobs/${currentJob}/stop`, {method: 'POST'}); } catch (e) { error(e.message); }
+});
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function poll(id) {
   let streamAttached = false, settingsShown = false;
@@ -82,7 +64,7 @@ async function poll(id) {
     $('phase').textContent = job.phase;
     if (!settingsShown) {
       $('image-size').value = job.image_size || 640;
-      $('selection').value = job.temporal_selection || 'average';
+      $('min-height').value = job.min_height ?? 16;
       $('confidence').value = job.confidence; $('conf-value').textContent = Number(job.confidence).toFixed(2);
       for (const name of ['denoise', 'sharpen', 'padding', 'rectify']) $(name).checked = Boolean(job.preprocessing?.[name]);
       settingsShown = true;
@@ -108,15 +90,16 @@ async function poll(id) {
         $('live-crop-image').src = `/media/${id}/${item.crop}`;
         $('live-input-image').src = `/media/${id}/${item.ocr_input}`;
         $('live-plate-text').textContent = item.text || '(chuỗi trống)';
-        $('live-plate-meta').textContent = `Frame ${item.frame} · ${timeLabel(item.time_seconds)} · ${item.width} × ${item.height} px · YOLO ${(item.detection_confidence*100).toFixed(1)}% · ${ocrLabel(item)} ${(item.ocr_confidence*100).toFixed(1)}%${averageLabel(item)} · ${item.padding ? "viền 5% · " : ""}${item.rectified ? "đã nắn thẳng · " : ""}${processingLabel(item.preprocessing)}`;
+        $('live-plate-meta').textContent = `Frame ${item.frame} · ${timeLabel(item.time_seconds)} · ${item.width} × ${item.height} px · YOLO ${(item.detection_confidence*100).toFixed(1)}% · OCR ${(item.ocr_confidence*100).toFixed(1)}% · ${item.padding ? "viền 5% · " : ""}${item.rectified ? "đã nắn thẳng · " : ""}${processingLabel(item.preprocessing)}`;
         $('live-crop').onclick = $('live-input').onclick = () => openCrop(item);
       } else {
         $('live-plate-text').textContent = 'Không có box qua ngưỡng';
         $('live-plate-meta').textContent = `Frame ${job.latest_frame} · ${timeLabel(job.time_seconds)}`;
       }
     }
+    $('stop').hidden = !job.source_url || ['done', 'error'].includes(job.status); $('stop').disabled = false;
     if (job.total_frames) { const pct = Math.min(99, Math.floor(100 * job.frames / job.total_frames)); $('progress').value = pct; $('percent').textContent = `${pct}%`; }
-    $('progress-detail').textContent = `${job.processed_frames ?? job.frames} frame đã xử lý · ${job.detections} lượt OCR · ${job.plate_count ?? 0} biển đã gom${job.skipped_frames ? ` · bỏ qua ${job.skipped_frames} frame để giữ nhịp clip` : ''}`;
+    $('progress-detail').textContent = `${job.processed_frames ?? job.frames} frame đã xử lý · ${job.detections} lượt OCR · ${job.plate_count ?? 0} biển đã gom${job.frame_stride > 1 ? ` · đọc 1/${job.frame_stride} frame` : ''}${job.too_small ? ` · ${job.too_small} crop quá nhỏ không OCR` : ''}`;
     if (job.status === 'error') throw Error(job.error);
     if (job.status === 'done') {
       $('progress').value = 100; $('percent').textContent = '100%'; $('live-badge').hidden = true; $('live-inspector').hidden = true;
@@ -141,16 +124,16 @@ function openCrop(item) {
   $('processed-figure').hidden = !item.ocr_input;
   if (item.ocr_input) $('zoom-input-image').src = `/media/${currentJob}/${item.ocr_input}`;
   $('zoom-text').textContent = item.text || '(chuỗi trống)';
-  $('zoom-meta').textContent = `Crop gốc ${item.width} × ${item.height} px · YOLO ${(item.detection_confidence*100).toFixed(1)}% · ${ocrLabel(item)} ${(item.ocr_confidence*100).toFixed(1)}%${averageLabel(item)} · Frame ${item.frame} · ${timeLabel(item.time_seconds)} · ${item.padding ? "viền 5% · " : ""}${item.rectified ? "đã nắn thẳng · " : ""}${processingLabel(item.preprocessing)}${item.observations ? ` · ${item.observations} lần quan sát · đồng thuận ${(item.text_agreement*100).toFixed(0)}%` : ''}`;
+  $('zoom-meta').textContent = `Crop gốc ${item.width} × ${item.height} px · YOLO ${(item.detection_confidence*100).toFixed(1)}% · OCR ${(item.ocr_confidence*100).toFixed(1)}% · Frame ${item.frame} · ${timeLabel(item.time_seconds)} · ${item.padding ? "viền 5% · " : ""}${item.rectified ? "đã nắn thẳng · " : ""}${processingLabel(item.preprocessing)}${item.observations ? ` · ${item.observations} lần quan sát · đồng thuận ${(item.text_agreement*100).toFixed(0)}%` : ''}`;
   $('seek').hidden = !mediaArea.querySelector('video'); $('crop-dialog').showModal();
 }
 async function loadPage() {
-  const data = await jsonFetch(`/api/jobs/${currentJob}/results?page=${page}&view=${currentView}&selection=${$('selection').value}`);
+  const data = await jsonFetch(`/api/jobs/${currentJob}/results?page=${page}&view=${currentView}`);
   total = data.total; $('gallery').replaceChildren(); $('count').textContent = total;
-  $('download-csv').href = currentView === 'plates' ? `/api/jobs/${currentJob}/results?format=csv&selection=${$('selection').value}` : `/media/${currentJob}/results.csv`;
+  $('download-csv').href = currentView === 'plates' ? `/api/jobs/${currentJob}/results?format=csv` : `/media/${currentJob}/results.csv`;
   $('download-csv').textContent = currentView === 'plates' ? 'Tải CSV đã gom ↗' : 'Tải CSV từng frame ↗';
   $('empty-gallery').hidden = total !== 0;
-  $('empty-gallery').textContent = 'Không tìm thấy biển số với ngưỡng hiện tại. Bạn có thể thử giảm ngưỡng YOLO hoặc dùng ảnh rõ hơn.';
+  $('empty-gallery').textContent = 'Không tìm thấy biển số với ngưỡng hiện tại. Bạn có thể thử giảm ngưỡng YOLO hoặc thử video rõ hơn.';
   for (const item of data.items) {
     const card = document.createElement('article'); card.className = 'crop-card';
     const crop = document.createElement('button'); crop.className = 'crop-button'; crop.setAttribute('aria-label', `Phóng lớn biển ${item.text}`);
@@ -159,13 +142,13 @@ async function loadPage() {
     const info = document.createElement('div'); info.className = 'crop-info';
     const text = document.createElement('p'); text.className = 'plate-text'; text.textContent = item.text || '(trống)';
     const scores = document.createElement('div'); scores.className = 'scores';
-    for (const [label, score] of [['YOLO',item.detection_confidence], [ocrLabel(item),item.ocr_confidence]]) { const span = document.createElement('span'); span.textContent = `${label} `; const b = document.createElement('b'); b.textContent = `${(score*100).toFixed(1)}%`; span.append(b); scores.append(span); }
+    for (const [label, score] of [['YOLO',item.detection_confidence], ['OCR',item.ocr_confidence]]) { const span = document.createElement('span'); span.textContent = `${label} `; const b = document.createElement('b'); b.textContent = `${(score*100).toFixed(1)}%`; span.append(b); scores.append(span); }
     const groupInfo = document.createElement('div'); groupInfo.className = 'observation-info';
     if (item.observations) {
       groupInfo.textContent = `${item.observations} lần · ${timeLabel(item.first_time)} – ${timeLabel(item.last_time)}`;
       const agreement = document.createElement('small');
-      const stable = (item.window_frames || item.observations) >= 3 && item.text_agreement >= 0.6;
-      agreement.textContent = `Đồng thuận ${(item.text_agreement*100).toFixed(0)}%${item.window_frames ? ` trong ${item.window_frames} frame gần nhất` : ''} · ${stable ? 'ổn định' : 'cần kiểm tra'}${averageLabel(item)}`;
+      const stable = item.observations >= 3 && item.text_agreement >= 0.6;
+      agreement.textContent = `Đồng thuận ${(item.text_agreement*100).toFixed(0)}% · ${stable ? 'ổn định' : 'cần kiểm tra'}`;
       groupInfo.append(agreement);
     } else groupInfo.hidden = true;
     const meta = document.createElement('div'); meta.className = 'crop-meta'; const size = document.createElement('span'); size.textContent = `${item.width} × ${item.height} px`;
@@ -192,4 +175,3 @@ $('result-view').addEventListener('change', async e => {
   if (currentJob) { try { await loadPage(); } catch (err) { error(err.message); } }
 });
 
-$('selection').addEventListener('change', async () => { page = 0; if (currentJob) { try { await loadPage(); } catch (err) { error(err.message); } } });

@@ -1,4 +1,4 @@
-"""Run the trained YOLO detector and OCR model E over a video clip."""
+"""Run the trained YOLO detector and OCR model F over a video clip."""
 
 from __future__ import annotations
 
@@ -19,7 +19,9 @@ from custom_alpr.custom_ocr import build_model
 from custom_alpr.preprocessing import prepare_ocr_input
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OCR = ROOT / "custom_alpr/outputs/train-custom-ocr/run-20261028-08-parseq-e-all/best.pt"
+DEFAULT_OCR = (
+    ROOT / "custom_alpr/outputs/train-custom-ocr/run-20261029-09-parseq-f-compress/best.pt"
+)
 DEFAULT_DETECTOR = (
     ROOT / "custom_alpr/outputs/vast-yolo-20261028/remote-results/moderate-s42/weights/best.pt"
 )
@@ -34,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", help="auto, cpu, mps, cuda:0, or 0")
     parser.add_argument("--confidence", type=float, default=0.25, help="YOLO confidence")
     parser.add_argument("--ocr-batch-size", type=int, default=16)
-    parser.add_argument("--imgsz", type=int, choices=(320, 640, 960, 1280), default=640)
+    parser.add_argument("--imgsz", type=int, choices=(320, 640), default=640)
     parser.add_argument("--denoise", action="store_true", help="Light OCR crop denoising")
     parser.add_argument("--sharpen", action="store_true", help="Light OCR crop sharpening")
     args = parser.parse_args()
@@ -100,31 +102,51 @@ def ocr_crops(
     sharpen: bool = False,
     rectify: bool = False,
 ) -> list[tuple[str, float]]:
-    tensors = []
-    for crop in crops:
-        array = prepare_ocr_input(crop, denoise=denoise, sharpen=sharpen, rectify=rectify)
-        tensors.append(torch.from_numpy(array).permute(2, 0, 1).float().div_(255.0))
+    arrays = [
+        prepare_ocr_input(crop, denoise=denoise, sharpen=sharpen, rectify=rectify)
+        for crop in crops
+    ]
+    return ocr_arrays(arrays, model, device)
+
+
+def ocr_arrays(
+    arrays: list[np.ndarray], model: torch.nn.Module, device: torch.device
+) -> list[tuple[str, float]]:
+    """Recognize already-prepared 128x64 RGB uint8 model inputs in one batch."""
+    tensors = [torch.from_numpy(array).permute(2, 0, 1).float().div_(255.0) for array in arrays]
     batch = torch.stack(tensors).to(device)
     with torch.inference_mode():
         texts, confidences = model.generate_with_confidence(batch)
     return list(zip(texts, confidences, strict=True))
 
 
-def select_best_box(boxes, width: int, height: int) -> tuple | None:
-    """Choose the highest-confidence valid crop from thresholded YOLO detections."""
-    best = None
+def select_boxes(boxes, width: int, height: int, *, with_ids: bool = False) -> list[tuple]:
+    """All valid crops from thresholded YOLO detections, highest confidence first.
+
+    With ``with_ids`` each tuple gains the tracker ID (None when YOLO has not
+    assigned one yet).
+    """
+    selected = []
     if boxes is None:
-        return None
+        return selected
     for box in boxes:
         x1, y1, x2, y2 = map(int, np.rint(box.xyxy[0].cpu().tolist()))
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(width, x2), min(height, y2)
         if x2 <= x1 or y2 <= y1:
             continue
-        confidence = float(box.conf.item())
-        if best is None or confidence > best[4]:
-            best = (x1, y1, x2, y2, confidence)
-    return best
+        row = (x1, y1, x2, y2, float(box.conf.item()))
+        if with_ids:
+            track_id = getattr(box, "id", None)
+            row += (None if track_id is None else int(track_id.item()),)
+        selected.append(row)
+    return sorted(selected, key=lambda item: item[4], reverse=True)
+
+
+def select_best_box(boxes, width: int, height: int) -> tuple | None:
+    """Choose the highest-confidence valid crop from thresholded YOLO detections."""
+    selected = select_boxes(boxes, width, height)
+    return selected[0] if selected else None
 
 
 def draw_detections(
@@ -207,12 +229,12 @@ def run_video(args: argparse.Namespace) -> dict:  # noqa: PLR0915
                     verbose=False,
                     imgsz=args.imgsz,
                 )[0]
-                crops, metadata = [], []
-                best = select_best_box(prediction.boxes, width, height)
-                if best is not None:
-                    x1, y1, x2, y2, _ = best
-                    crops.append(cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2RGB))
-                    metadata.append(best)
+                # Every plate YOLO found, matching the web demo.
+                metadata = select_boxes(prediction.boxes, width, height)
+                crops = [
+                    cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
+                    for x1, y1, x2, y2, _ in metadata
+                ]
 
                 frame_results = []
                 for start in range(0, len(crops), args.ocr_batch_size):

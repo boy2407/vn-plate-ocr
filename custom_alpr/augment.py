@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import math
 
 import cv2
@@ -149,6 +150,122 @@ def random_salt_pepper(
     noisy[draw < amount / 2] = 0
     noisy[(draw >= amount / 2) & (draw < amount)] = 255
     return noisy
+
+
+def _at_source_size(
+    image: np.ndarray,
+    rng: np.random.Generator,
+    min_height: int,
+    max_height: int,
+    transform,
+) -> np.ndarray:
+    """Shrink to a random plate height, transform there, then enlarge back.
+
+    Video is compressed at its own resolution, while the plate is still small.
+    """
+    height, width = image.shape[:2]
+    small_height = int(rng.integers(min_height, max_height + 1))
+    small_width = max(1, round(width * small_height / height))
+    small = cv2.resize(image, (small_width, small_height), interpolation=cv2.INTER_AREA)
+    return cv2.resize(transform(small), (width, height), interpolation=cv2.INTER_LINEAR)
+
+
+def random_jpeg(
+    image: np.ndarray,
+    rng: np.random.Generator,
+    probability: float = 0.3,
+    min_height: int = 14,
+    max_height: int = 48,
+    min_quality: int = 25,
+    max_quality: int = 60,
+) -> np.ndarray:
+    """Sometimes JPEG-compress a small copy: 8x8 blocking and ringing around strokes."""
+    if not 0 <= probability <= 1:
+        raise ValueError("probability must be between 0 and 1")
+    if rng.random() >= probability:
+        return image
+    quality = int(rng.integers(min_quality, max_quality + 1))
+
+    def compress(small: np.ndarray) -> np.ndarray:
+        ok, encoded = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if not ok:
+            raise ValueError("JPEG encoding failed")
+        return cv2.imdecode(encoded, cv2.IMREAD_UNCHANGED).reshape(small.shape)
+
+    return _at_source_size(image, rng, min_height, max_height, compress)
+
+
+def h264_round_trip(
+    image: np.ndarray, crf: int, shift: tuple[float, float] = (0.0, 0.0), frames: int = 4
+) -> np.ndarray:
+    """Encode a short clip of ``image`` drifting by ``shift`` px; return the last decoded frame.
+
+    With B-frames disabled the last frame is a P-frame, so it carries the motion
+    prediction artefacts of real H.264 video, not only intra-frame blocking.
+    """
+    import av  # noqa: PLC0415 -- optional training dependency
+
+    height, width = image.shape[:2]
+    # yuv420p needs even sides; x264 rejects frames smaller than a macroblock.
+    padded_height, padded_width = max(16, height + height % 2), max(16, width + width % 2)
+    padded = cv2.copyMakeBorder(
+        image, 0, padded_height - height, 0, padded_width - width, cv2.BORDER_REPLICATE
+    )
+    buffer = io.BytesIO()
+    with av.open(buffer, "w", format="h264") as output:
+        stream = output.add_stream("libx264", rate=25)
+        stream.width, stream.height = padded_width, padded_height
+        stream.pix_fmt = "yuv420p"
+        stream.options = {"crf": str(crf), "preset": "ultrafast", "tune": "zerolatency"}
+        for index in range(frames):
+            fraction = index / max(1, frames - 1)
+            matrix = np.float32([[1, 0, shift[0] * fraction], [0, 1, shift[1] * fraction]])
+            frame = cv2.warpAffine(
+                padded, matrix, (padded_width, padded_height), borderMode=cv2.BORDER_REPLICATE
+            )
+            for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
+                output.mux(packet)
+        for packet in stream.encode():
+            output.mux(packet)
+    buffer.seek(0)
+    with av.open(buffer, "r", format="h264") as source:
+        decoded = [frame.to_ndarray(format="rgb24") for frame in source.decode(video=0)]
+    return np.ascontiguousarray(decoded[-1][:height, :width])
+
+
+def random_h264(
+    image: np.ndarray,
+    rng: np.random.Generator,
+    probability: float = 0.15,
+    min_height: int = 14,
+    max_height: int = 48,
+    min_crf: int = 26,
+    max_crf: int = 38,
+    max_shift: float = 2.0,
+) -> np.ndarray:
+    """Sometimes pass a small copy through real H.264 (libx264) with slight motion."""
+    if not 0 <= probability <= 1:
+        raise ValueError("probability must be between 0 and 1")
+    if rng.random() >= probability:
+        return image
+    crf = int(rng.integers(min_crf, max_crf + 1))
+    shift = tuple(float(value) for value in rng.uniform(-max_shift, max_shift, size=2))
+    return _at_source_size(
+        image, rng, min_height, max_height, lambda small: h264_round_trip(small, crf, shift)
+    )
+
+
+def random_compression(
+    image: np.ndarray,
+    rng: np.random.Generator,
+    h264_probability: float = 0.15,
+    jpeg_probability: float = 0.3,
+) -> np.ndarray:
+    """At most one compression per crop: H.264 first, otherwise maybe JPEG."""
+    compressed = random_h264(image, rng, probability=h264_probability)
+    if compressed is not image:
+        return compressed
+    return random_jpeg(image, rng, probability=jpeg_probability)
 
 
 def random_blue_plate(

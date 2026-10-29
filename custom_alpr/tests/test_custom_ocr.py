@@ -10,6 +10,8 @@ from custom_alpr.augment import (
     random_downscale,
     random_gaussian_noise,
     random_glare,
+    random_h264,
+    random_jpeg,
     random_photometric,
     random_rotate_perspective,
     random_salt_pepper,
@@ -46,6 +48,7 @@ from custom_alpr.custom_ocr_data import (
         random_blue_plate,
         random_rotate_perspective,
         random_view_tilt,
+        random_jpeg,
     ],
 )
 def test_augmentations_keep_shape_and_respect_probability(augment):
@@ -212,3 +215,26 @@ def test_looks_straight_rejects_tilted_and_featureless_crops():
     assert not looks_straight(rotated)
     assert not looks_straight(np.full((64, 128, 3), 128, dtype=np.uint8))
     assert tilted.shape == image.shape
+
+
+def test_h264_keeps_odd_sized_small_crops():
+    pytest.importorskip("av")
+    rng = np.random.default_rng(0)
+    image = rng.integers(0, 256, size=(37, 75, 3), dtype=np.uint8)
+    assert random_h264(image, rng, probability=0.0) is image
+    changed = random_h264(image, rng, probability=1.0)
+    assert changed.shape == image.shape and changed.dtype == np.uint8
+    assert not np.array_equal(changed, image)
+
+
+def test_compression_applies_at_most_one_codec(monkeypatch):
+    import custom_alpr.augment as augment
+
+    calls = []
+    monkeypatch.setattr(augment, "random_h264", lambda image, rng, probability: image + 1)
+    monkeypatch.setattr(
+        augment, "random_jpeg", lambda image, rng, probability: calls.append(1) or image
+    )
+    image = np.zeros((8, 16, 3), dtype=np.uint8)
+    assert augment.random_compression(image, np.random.default_rng(0))[0, 0, 0] == 1
+    assert not calls

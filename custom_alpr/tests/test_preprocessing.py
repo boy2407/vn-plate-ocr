@@ -74,7 +74,7 @@ def test_saved_ocr_input_matches_pixels_passed_to_model(tmp_path, denoise, sharp
         predict=lambda *_args, **_kwargs: [SimpleNamespace(boxes=[box])]
     )
     frame = np.random.default_rng(4).integers(0, 256, (35, 55, 3), dtype=np.uint8)
-    results = engine.recognize(frame, 0.25, denoise=denoise, sharpen=sharpen)
+    results, _ = engine.recognize(frame, 0.25, denoise=denoise, sharpen=sharpen)
     web_app.store_crops(frame, results, tmp_path, 0, 25)
     item = results[0]
     saved = cv2.cvtColor(cv2.imread(str(tmp_path / item["ocr_input"])), cv2.COLOR_BGR2RGB)
@@ -140,7 +140,7 @@ def test_padding_and_rectification_preview_matches_actual_ocr_tensor(tmp_path):
     box = SimpleNamespace(xyxy=torch.tensor([[8, 4, 232, 106]]), conf=torch.tensor(0.9))
     engine.detector = SimpleNamespace(predict=lambda *_a, **_kw: [SimpleNamespace(boxes=[box])])
     frame = cv2.cvtColor(skewed_plate(), cv2.COLOR_RGB2BGR)
-    results = engine.recognize(frame, 0.4, padding=True, rectify=True)
+    results, _ = engine.recognize(frame, 0.4, padding=True, rectify=True)
     assert results[0]["box"] == [8, 4, 232, 106]
     assert results[0]["crop_box"] == [0, 0, 240, 110]
     assert results[0]["rectified"]

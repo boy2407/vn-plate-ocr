@@ -99,7 +99,7 @@ def test_existing_job_gets_grouped_view_without_rerunning_model(tmp_path):
 @pytest.mark.parametrize("value", ["640.5", "10000", "bad"])
 def test_invalid_detector_resolution_is_rejected(value):
     web = pytest.importorskip("custom_alpr.web_app")
-    with pytest.raises(ValueError, match="320, 640"):
+    with pytest.raises(ValueError, match="320 hoặc 640"):
         web.inference_settings({"image_size": value})
 
 
@@ -108,8 +108,9 @@ def test_quality_selects_clearer_crop_of_consensus_without_rewriting_ocr():
     clear["crop_quality"] = {"score": 0.85}
     blurred = observation(time=0.1, confidence=0.99, crop="blurred.png")
     blurred["crop_quality"] = {"score": 0.1}
+    # One sharp misread does not outvote two reads of the same string.
     wrong = observation("51H21580", time=0.2, confidence=0.999, crop="wrong.png")
-    wrong["crop_quality"] = {"score": 0.99}
+    wrong["crop_quality"] = {"score": 0.5}
     result = group_observations([clear, blurred, wrong])[0]
     assert result["text"] == "51H21510"
     assert result["crop"] == "clear.png"
@@ -117,21 +118,7 @@ def test_quality_selects_clearer_crop_of_consensus_without_rewriting_ocr():
     assert wrong["text"] == "51H21580"
 
 
-def test_ocr_selection_can_choose_high_confidence_minority_and_preserves_evidence():
-    rows = [
-        observation(time=0),
-        observation(time=0.1),
-        observation("51H21580", time=0.2, confidence=0.99, crop="highest.png"),
-    ]
-    assert group_observations(rows)[0]["text"] == "51H21510"
-    result = group_observations(rows, selection="ocr")[0]
-    assert result["text"] == "51H21580"
-    assert result["crop"] == "highest.png"
-    assert result["text_agreement"] == pytest.approx(1 / 3)
-    assert rows[0]["text"] == "51H21510"
-
-
-def test_ocr_review_and_csv_follow_selection_without_rerunning_models(tmp_path):
+def test_review_page_and_csv_regroup_raw_observations(tmp_path):
     web = pytest.importorskip("custom_alpr.web_app")
     job_id = "b" * 32
     folder = tmp_path / job_id
@@ -145,78 +132,41 @@ def test_ocr_review_and_csv_follow_selection_without_rerunning_models(tmp_path):
     (folder / "job.json").write_text(json.dumps(dict(id=job_id, status="done", kind="video")))
     client = web.create_app(output=tmp_path).test_client()
     route = f"/api/jobs/{job_id}/results"
-    consensus = client.get(route).get_json()
-    selected = client.get(route + "?selection=ocr").get_json()
-    assert consensus["items"][0]["text"] == "51H21510"
-    assert selected["items"][0]["text"] == "30A12345"
-    downloaded = client.get(route + "?selection=ocr&format=csv")
-    assert "30A12345" in downloaded.text and "51H21510" not in downloaded.text
-    assert client.get(route + "?selection=unknown").status_code == 400
+    assert client.get(route).get_json()["items"][0]["text"] == "51H21510"
+    downloaded = client.get(route + "?format=csv")
+    assert "51H21510" in downloaded.text and "30A12345" not in downloaded.text
+    raw = client.get(route + "?view=frames").get_json()["items"]
+    assert raw[2]["text"] == "30A12345" and raw[2]["ocr_confidence"] == 0.99
     assert json.loads((folder / "results.json").read_text())[0]["text"] == "51H21510"
 
-
-def test_average_votes_over_five_frames_and_averages_only_winning_string():
-    rows = [
-        observation(time=0, confidence=0.6, crop="a.png"),
-        observation(time=0.1, confidence=0.8, crop="b.png"),
-        observation("51H21580", time=0.2, confidence=0.99, crop="wrong.png"),
-        observation(time=0.3, confidence=0.7, crop="c.png"),
-    ]
-    result = group_observations(rows, selection="average")[0]
-    assert result["text"] == "51H21510"
-    assert result["ocr_confidence"] == pytest.approx(0.7)
-    assert result["averaged_frames"] == 3 and result["window_frames"] == 4
-    assert result["representative_ocr_confidence"] == 0.8
-    assert result["crop"] == "b.png"
-    assert result["text_agreement"] == 0.75
-    assert [r["ocr_confidence"] for r in rows] == [0.6, 0.8, 0.99, 0.7]
+def test_yolo_track_id_keeps_one_track_across_a_jump_iou_would_split():
+    tracker = PlateTracker()
+    first = observation(time=0, box=[10, 20, 110, 70])
+    first["yolo_track_id"] = 7
+    jumped = observation(time=0.2, box=[400, 300, 500, 350])
+    jumped["yolo_track_id"] = 7
+    tracker.observe_frame([first])
+    tracker.observe_frame([jumped])
+    assert first["track_id"] == jumped["track_id"]
 
 
-def test_average_uses_latest_five_and_excludes_earlier_predictions():
-    rows = [observation(time=i / 10, confidence=0.9) for i in range(5)]
-    rows += [observation("30A12345", time=(i + 5) / 10, confidence=0.6 + i / 10) for i in range(3)]
-    rows += [observation(time=i / 10, confidence=0.99) for i in (8, 9)]
-    result = group_observations(rows, selection="average")[0]
-    assert result["text"] == "30A12345"
-    assert result["window_frames"] == 5 and result["averaged_frames"] == 3
-    assert result["ocr_confidence"] == pytest.approx(0.7)
-    assert result["observations"] == 10
-    assert result["text_agreement"] == 0.6
+def test_different_yolo_ids_in_one_frame_never_share_a_track():
+    tracker = PlateTracker()
+    a, b = observation(time=0), observation("29A11111", time=0, box=[12, 21, 112, 71])
+    a["yolo_track_id"], b["yolo_track_id"] = 1, 2
+    tracker.observe_frame([a, b])
+    c, d = observation(time=0.1), observation("29A11111", time=0.1, box=[12, 21, 112, 71])
+    c["yolo_track_id"], d["yolo_track_id"] = 2, 1
+    tracker.observe_frame([c, d])
+    assert c["track_id"] == b["track_id"] and d["track_id"] == a["track_id"]
 
 
-def test_new_track_starts_a_fresh_window_and_merged_gallery_does_not_average_tracks():
-    tracker = PlateTracker(selection="average")
-    tracker.observe(observation(time=0, confidence=0.5))
-    tracker.observe(observation(time=0.1, confidence=0.7))
-    latest = tracker.observe(observation(time=2, confidence=0.9))
-    assert latest["window_frames"] == latest["averaged_frames"] == 1
-    assert latest["ocr_confidence"] == 0.9
-    merged = tracker.summaries()[0]
-    assert merged["track_count"] == 2 and merged["observations"] == 3
-    assert merged["window_frames"] == 1 and merged["text_votes"] == 1
-    assert merged["ocr_confidence"] == 0.9
-
-
-def test_average_review_csv_keeps_original_frame_predictions(tmp_path):
+def test_saved_plates_match_the_review_grouping(tmp_path):
     web = pytest.importorskip("custom_alpr.web_app")
-    job_id = "c" * 32
-    folder = tmp_path / job_id
-    folder.mkdir()
-    rows = [
-        observation(time=0, confidence=0.6),
-        observation(time=0.1, confidence=0.8),
-        observation("30A12345", time=0.2, confidence=0.99),
-    ]
-    (folder / "results.json").write_text(json.dumps(rows))
-    (folder / "job.json").write_text(json.dumps(dict(id=job_id, status="done", kind="video")))
-    client = web.create_app(output=tmp_path).test_client()
-    route = f"/api/jobs/{job_id}/results"
-    result = client.get(route + "?selection=average").get_json()["items"][0]
-    assert result["text"] == "51H21510" and result["ocr_confidence"] == pytest.approx(0.7)
-    csv_text = client.get(route + "?selection=average&format=csv").text
-    assert "mean_ocr_confidence" in csv_text and "averaged_frames" in csv_text
-    raw = client.get(route + "?view=frames&selection=average").get_json()["items"]
-    assert raw[2]["text"] == "30A12345" and raw[2]["ocr_confidence"] == 0.99
-    assert web.temporal_setting({}) == "average"
-    with pytest.raises(ValueError):
-        web.temporal_setting({"selection": "bad"})
+    rows = [observation(time=t / 10, crop=f"{t}.png") for t in range(3)]
+    for row in rows:
+        row.update(track_id=None)
+    plates = web.write_results(tmp_path, rows)
+    saved = json.loads((tmp_path / "plates.json").read_text(encoding="utf-8"))
+    assert len(plates) == len(saved) == 1
+    assert saved[0]["text_votes"] == 3

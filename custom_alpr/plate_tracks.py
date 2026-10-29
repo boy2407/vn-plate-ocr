@@ -2,13 +2,27 @@
 
 from __future__ import annotations
 
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass, field
 from math import hypot
+import re
+
+# Civil (incl. 2-letter series, motorbike "29B1", "MĐ1") and 2-letter military plates.
+PLATE_FORMAT = re.compile(r"^(?:\d{2}[A-ZĐ]{1,2}\d?\d{4,5}|[A-Z]{2}\d{4,5})$")
 
 
 def normalized_text(text: str) -> str:
     return "".join(char for char in text.upper() if char.isalnum())
+
+
+def valid_plate(text: str) -> bool:
+    return bool(PLATE_FORMAT.match(text))
+
+
+def vote_weight(item: dict) -> float:
+    """A sharp, confidently read crop counts more than a blurred one."""
+    quality = item.get("crop_quality", {}).get("score")
+    return item["ocr_confidence"] * (1.0 if quality is None else quality)
 
 
 def representative_key(item: dict) -> tuple:
@@ -46,38 +60,31 @@ class PlateTrack:
     last_time: float
     observations: int = 0
     counts: dict = field(default_factory=lambda: defaultdict(int))
-    scores: dict = field(default_factory=lambda: defaultdict(float))
+    weights: dict = field(default_factory=lambda: defaultdict(float))
     best: dict = field(default_factory=dict)
-    best_ocr: dict = field(default_factory=dict)
-    recent: deque = field(default_factory=lambda: deque(maxlen=5))
 
     def add(self, item: dict):
         text = normalized_text(item["text"])
         item["track_id"] = self.track_id
-        self.recent.append(item.copy())
         self.observations += 1
         self.counts[text] += 1
-        self.scores[text] += item["ocr_confidence"]
+        self.weights[text] += vote_weight(item)
         if text not in self.best or representative_key(item) > representative_key(self.best[text]):
             self.best[text] = item
-        if (
-            text not in self.best_ocr
-            or item["ocr_confidence"] > self.best_ocr[text]["ocr_confidence"]
-        ):
-            self.best_ocr[text] = item
         self.box = item["box"]
         self.last_time = item["time_seconds"]
 
-    def summary(self, selection: str = "consensus") -> dict:
-        if selection == "average":
-            return self.average_summary()
-        if selection == "ocr":
-            text = max(self.best_ocr, key=lambda value: self.best_ocr[value]["ocr_confidence"])
-            item = self.best_ocr[text].copy()
-        else:
-            text = max(self.counts, key=lambda value: (self.counts[value], self.scores[value]))
-            item = self.best[text].copy()
+    def summary(self) -> dict:
+        """Vote over the whole track: well-formed plates first, then quality-weighted votes."""
+        text = max(
+            self.counts,
+            key=lambda value: (valid_plate(value), self.weights[value], self.counts[value]),
+        )
+        item = self.best[text].copy()
+        total = sum(self.weights.values())
         item.update(
+            plate_format_valid=valid_plate(text),
+            text_weight_share=self.weights[text] / total if total else 0.0,
             observations=self.observations,
             first_time=self.first_time,
             last_time=self.last_time,
@@ -85,106 +92,101 @@ class PlateTrack:
             text_agreement=self.counts[text] / self.observations,
             track_ids=[self.track_id],
             track_count=1,
-            selection=selection,
-        )
-        return item
-
-    def average_summary(self) -> dict:
-        """Vote over at most five actual observations, never average different strings."""
-        grouped = defaultdict(list)
-        for row in self.recent:
-            grouped[normalized_text(row["text"])].append(row)
-        text = max(
-            grouped,
-            key=lambda value: (
-                len(grouped[value]),
-                sum(r["ocr_confidence"] for r in grouped[value]) / len(grouped[value]),
-            ),
-        )
-        matching = grouped[text]
-        item = max(matching, key=representative_key).copy()
-        mean = sum(r["ocr_confidence"] for r in matching) / len(matching)
-        item.update(
-            representative_ocr_confidence=item["ocr_confidence"],
-            ocr_confidence=mean,
-            mean_ocr_confidence=mean,
-            averaged_frames=len(matching),
-            window_frames=len(self.recent),
-            window_size=5,
-            window_first_time=self.recent[0]["time_seconds"],
-            window_last_time=self.recent[-1]["time_seconds"],
-            observations=self.observations,
-            first_time=self.first_time,
-            last_time=self.last_time,
-            text_votes=len(matching),
-            text_agreement=len(matching) / len(self.recent),
-            track_ids=[self.track_id],
-            track_count=1,
-            selection="average",
         )
         return item
 
 
 class PlateTracker:
-    """Light spatial association for the already-selected one box per frame.
+    """Light spatial association of plate boxes; each track takes one box per frame.
 
     A gap over one second starts another track. This is an OCR review aid, not
     vehicle identity tracking. Exact consensus texts are merged for the gallery;
     individual track IDs and all frame observations remain available separately.
     """
 
-    def __init__(self, max_gap: float = 1.0, selection: str = "consensus"):
-        if selection not in {"consensus", "ocr", "average"}:
-            raise ValueError("selection must be consensus, ocr or average")
+    def __init__(self, max_gap: float = 1.0):
         self.max_gap = max_gap
-        self.selection = selection
         self.tracks: list[PlateTrack] = []
         self.active: list[PlateTrack] = []
+        self.by_yolo_id: dict[int, PlateTrack] = {}
 
     def observe(self, item: dict):
-        now = item["time_seconds"]
+        return self.observe_frame([item])[0]
+
+    def observe_frame(self, items: list[dict]) -> list[dict]:
+        """Associate all boxes of one frame; a track takes at most one box per frame."""
+        if not items:
+            return []
+        now = items[0]["time_seconds"]
         self.active = [track for track in self.active if 0 <= now - track.last_time <= self.max_gap]
-        candidates = [(association_score(track.box, item["box"]), track) for track in self.active]
-        score, track = max(candidates, key=lambda pair: pair[0]) if candidates else (0, None)
-        if score <= 0:
-            track = PlateTrack(len(self.tracks) + 1, item["box"], now, now)
-            self.tracks.append(track)
-            self.active.append(track)
-        track.add(item)
-        return track.summary(self.selection)
+        assigned, used = {}, set()
+        # ByteTrack IDs from YOLO follow motion across gaps; trust them first.
+        for index, item in enumerate(items):
+            track = self.by_yolo_id.get(item.get("yolo_track_id"))
+            if track is not None and track.track_id not in used:
+                assigned[index] = track
+                used.add(track.track_id)
+                if track not in self.active:
+                    self.active.append(track)
+        pairs = sorted(
+            (
+                (association_score(track.box, item["box"]), index, track)
+                for index, item in enumerate(items)
+                if index not in assigned
+                for track in self.active
+                if track.track_id not in used
+            ),
+            key=lambda pair: (-pair[0], pair[1], pair[2].track_id),
+        )
+        for score, index, track in pairs:
+            if score <= 0:
+                break
+            if index not in assigned and track.track_id not in used:
+                assigned[index] = track
+                used.add(track.track_id)
+        summaries = []
+        for index, item in enumerate(items):
+            track = assigned.get(index)
+            if track is None:
+                track = PlateTrack(len(self.tracks) + 1, item["box"], now, now)
+                self.tracks.append(track)
+                self.active.append(track)
+            if item.get("yolo_track_id") is not None:
+                self.by_yolo_id[item["yolo_track_id"]] = track
+            track.add(item)
+            summaries.append(track.summary())
+        return summaries
 
     def summaries(self) -> list[dict]:
         grouped = {}
         for track in self.tracks:
-            item = track.summary(self.selection)
+            item = track.summary()
             text = normalized_text(item["text"])
             key = text or f"empty-track-{track.track_id}"
             if key not in grouped:
                 grouped[key] = item
                 continue
             previous = grouped[key]
-            rank = (
-                (lambda row: row["ocr_confidence"])
-                if self.selection in {"ocr", "average"}
-                else representative_key
-            )
-            best = (item if rank(item) > rank(previous) else previous).copy()
+            clearer = representative_key(item) > representative_key(previous)
+            best = (item if clearer else previous).copy()
             best.update(
                 observations=previous["observations"] + item["observations"],
                 first_time=min(previous["first_time"], item["first_time"]),
                 last_time=max(previous["last_time"], item["last_time"]),
                 track_ids=previous["track_ids"] + item["track_ids"],
                 track_count=previous["track_count"] + item["track_count"],
+                text_votes=previous["text_votes"] + item["text_votes"],
             )
-            if self.selection != "average":
-                best["text_votes"] = previous["text_votes"] + item["text_votes"]
-                best["text_agreement"] = best["text_votes"] / best["observations"]
+            best["text_agreement"] = best["text_votes"] / best["observations"]
             grouped[key] = best
         return sorted(grouped.values(), key=lambda item: item["first_time"])
 
 
-def group_observations(observations: list[dict], selection: str = "consensus") -> list[dict]:
-    tracker = PlateTracker(selection=selection)
-    for item in sorted(observations, key=lambda entry: (entry["time_seconds"], entry["frame"])):
-        tracker.observe(item)
+def group_observations(observations: list[dict]) -> list[dict]:
+    tracker = PlateTracker()
+    frames = defaultdict(list)
+    for item in observations:
+        frames[(item["time_seconds"], item["frame"])].append(item)
+    for key in sorted(frames):
+        tracker.observe_frame(frames[key])
     return tracker.summaries()

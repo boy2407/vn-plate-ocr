@@ -16,6 +16,7 @@ from custom_alpr.augment import (
     random_downscale,
     random_gaussian_noise,
     random_blue_plate,
+    random_compression,
     random_glare,
     random_motion_blur,
     random_photometric,
@@ -43,6 +44,7 @@ class PlateOCRDataset(Dataset):
         rotate: bool = False,
         strong_downscale: bool = False,
         view_tilt: bool = False,
+        compression: bool = False,
         seed: int = 0,
     ):
         self.manifest = manifest
@@ -52,6 +54,7 @@ class PlateOCRDataset(Dataset):
         self.rotate = rotate
         self.strong_downscale = strong_downscale
         self.view_tilt = view_tilt
+        self.compression = compression
         self.rng = np.random.default_rng(seed)
         self.samples: list[tuple[Path, str]] = []
         # Renders and synthetic plates are drawn straight; real crops are measured once.
@@ -110,6 +113,8 @@ class PlateOCRDataset(Dataset):
             if self.noise:
                 pixels = random_gaussian_noise(pixels, self.rng)
                 pixels = random_salt_pepper(pixels, self.rng)
+            if self.compression:  # last: video is compressed after the sensor adds noise
+                pixels = random_compression(pixels, self.rng)
         image_tensor = torch.from_numpy(pixels).permute(2, 0, 1).float().div_(255.0)
         target = torch.tensor(encode_target(text), dtype=torch.long)
         return image_tensor, target, text
