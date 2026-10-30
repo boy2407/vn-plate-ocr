@@ -83,6 +83,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--warmup-epochs", type=float, default=0.0)
     parser.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        help="fine-tune: start from this checkpoint's weights (same decoder and model config)",
+    )
+    parser.add_argument(
         "--select-by",
         choices=("val_loss", "greedy_exact"),
         default="val_loss",
@@ -285,7 +290,14 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     test_loader = DataLoader(test_dataset, shuffle=False, **loader_options)
 
     model_class = PlateOCRParseq if args.decoder == "parseq" else PlateOCR2D
-    model = model_class(max_output_length=args.max_output_length).to(device)
+    model = model_class(max_output_length=args.max_output_length)
+    if args.init_checkpoint:
+        initial = torch.load(args.init_checkpoint, map_location="cpu", weights_only=True)
+        if initial.get("decoder", "ar") != args.decoder:
+            raise SystemExit(f"{args.init_checkpoint} uses the {initial.get('decoder')} decoder")
+        model.load_state_dict(initial["model_state_dict"])
+        print(f"Initialized from {args.init_checkpoint} (epoch {initial.get('epoch')})")
+    model = model.to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
     )

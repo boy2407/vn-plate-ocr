@@ -19,8 +19,10 @@ from custom_alpr.custom_ocr import build_model
 from custom_alpr.preprocessing import prepare_ocr_input
 
 ROOT = Path(__file__).resolve().parents[1]
+# E-v1: model E fine-tuned on Kaggle + person-labelled video crops (finetune_video.sh, v1 "all").
+# Previous default, model E: run-20261029-09-parseq-f-compress/best.pt
 DEFAULT_OCR = (
-    ROOT / "custom_alpr/outputs/train-custom-ocr/run-20261029-09-parseq-f-compress/best.pt"
+    ROOT / "custom_alpr/outputs/train-custom-ocr/run-20261030-10-parseq-e-v1-video/best.pt"
 )
 DEFAULT_DETECTOR = (
     ROOT / "custom_alpr/outputs/vast-yolo-20261028/remote-results/moderate-s42/weights/best.pt"

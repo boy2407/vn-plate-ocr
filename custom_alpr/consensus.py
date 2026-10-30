@@ -11,6 +11,7 @@ adds new rows as Codex progresses. ``queue-final.csv`` holds the merged labels
 in the queue format for ``ingest_labels --queue``.
 
     python -m custom_alpr.consensus
+    python -m custom_alpr.consensus --confirmed-only   # plates only from the person
 """
 
 from __future__ import annotations
@@ -71,6 +72,9 @@ def write_rows(path: Path, fields: list[str], rows: list[dict]):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--collected", type=Path, default=COLLECTED)
+    parser.add_argument(
+        "--confirmed-only", action="store_true", help="Leave Codex/VLM agreements out; keep only plates a person labelled"
+    )
     return parser.parse_args()
 
 
@@ -102,7 +106,7 @@ def main() -> None:
             )
             # Only the person's decision is imported; undecided rows stay out.
             merged.update({key: previous.get(key, "") for key in ("verdict", "plate_text", "lines", "note")})
-        elif status == "pending":
+        elif status == "pending" or (status == "agree" and args.confirmed_only):
             continue
         final.append(merged)
 
