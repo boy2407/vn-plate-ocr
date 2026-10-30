@@ -1,0 +1,19 @@
+services:
+  ocr-demo:
+    image: vn-plate-ocr-demo:local
+    build:
+      context: ../..
+      dockerfile: deploy/ocr-demo/Dockerfile
+    container_name: vn-plate-ocr-demo
+    restart: unless-stopped
+    # Reached by the shared nginx VM (<NGINX_VM_IP>) over the LAN.
+    ports:
+      - "8766:8766"
+    # Shares the LXC with saigondepot and vietjobs-demo; cap it so a long clip cannot starve them.
+    mem_limit: 2g
+    cpus: 2
+    volumes:
+      - outputs:/app/custom_alpr/outputs/web-demo
+
+volumes:
+  outputs:

@@ -20,3 +20,5 @@
 | 016 | Record OCR architecture and implementation status | done | Codex | 2026-10-27 |
 | 017 | Document custom OCR progress and push changes | done | Codex | 2026-10-28 |
 | 067 | Sync and run web demo on desktop | in progress | Codex | 2026-10-29 |
+| 068 | Route OCR demo through shared Nginx | done | Codex | 2026-10-30 |
+| 069 | Document OCR demo Nginx operations | done | Codex | 2026-10-30 |

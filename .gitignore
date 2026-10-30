@@ -13,3 +13,6 @@ custom_alpr/outputs/
 *.onnx
 *.keras
 .env
+
+# Real hostnames/IPs for deploy files (kept out of git)
+.private/

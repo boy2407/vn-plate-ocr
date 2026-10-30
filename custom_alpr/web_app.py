@@ -256,7 +256,10 @@ def resolve_stream(url: str) -> tuple[str, str]:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "format": "bestvideo[height<=1080][ext=mp4]/bestvideo[height<=1080]/best[height<=1080]",
+        # H.264 first: opencv-python's FFmpeg has no software AV1 decoder, so an
+        # AV1 stream opens but yields no frames on a CPU server.
+        "format": "bestvideo[height<=1080][vcodec^=avc1]"
+        "/bestvideo[height<=1080][vcodec!^=av01]/best[height<=1080][vcodec!^=av01]",
     }
     try:
         info = yt_dlp.YoutubeDL(options).extract_info(url, download=False)
