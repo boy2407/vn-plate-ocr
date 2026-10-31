@@ -6,10 +6,13 @@ import numpy as np
 from custom_alpr.synth_plates import (
     Render,
     add_finish,
+    apply_video_degradation,
     background_patch,
     combine_with_train,
     compose,
     glyph_library,
+    load_confusable_weights,
+    make_vehicle_context,
     new_text,
     segment,
 )
@@ -117,3 +120,64 @@ def test_add_finish_keeps_shape_and_shades_the_plate():
     out = add_finish(image, render, np.random.default_rng(0))
     assert out.shape == image.shape and out.dtype == np.uint8
     assert not np.array_equal(out, image)
+
+
+def test_confusable_weights_follow_observed_pair_counts(tmp_path):
+    report = tmp_path / "confusions.json"
+    report.write_text(
+        '{"E/train":{"free":{"top_confusions":[["7->2",6],["N->M",5],["2->0",3]]}}}',
+        encoding="utf-8",
+    )
+    weights = load_confusable_weights(report)
+    assert weights["7"] == 7
+    assert weights["2"] == 10
+    assert weights["0"] == 4
+    assert weights["N"] == weights["M"] == 6
+
+
+def test_confusable_boost_changes_character_sampling():
+    library = {"0": [np.ones((4, 2))], "1": [np.ones((4, 2))]}
+    text = new_text(
+        "000", library, {}, ["51"], np.random.default_rng(0), confusable_weights={"1": 100}
+    )
+    assert text == "111"
+
+
+def test_confusable_letter_boost_overrides_existing_letter_balance():
+    library = {"H": [np.ones((4, 2))], "Q": [np.ones((4, 2))]}
+    generated = {"H": 0}
+    text = new_text(
+        "AAA",
+        library,
+        {"H": 1200, "Q": 1200},
+        ["51"],
+        np.random.default_rng(0),
+        confusable_weights={"H": 1},
+        confusable_generated=generated,
+    )
+    assert text == "HHH"
+    assert generated["H"] == 1
+
+
+def test_vehicle_context_has_random_10_to_60_percent_margins():
+    plate = drawn_plate("51A12345")
+    context, margins = make_vehicle_context(plate, np.random.default_rng(4))
+    left, top, _right, _bottom = margins
+    assert all(0.10 <= value <= 0.60 for value in margins)
+    assert context.shape[0] > plate.shape[0] and context.shape[1] > plate.shape[1]
+    assert context.dtype == np.uint8
+    x, y = round(left * plate.shape[1]), round(top * plate.shape[0])
+    assert np.array_equal(context[y : y + plate.shape[0], x : x + plate.shape[1]], plate)
+
+
+def test_video_degradation_keeps_dimensions_and_downscales_to_video_range():
+    image = drawn_plate("51A12345")
+    out, flags = apply_video_degradation(
+        image,
+        np.random.default_rng(0),
+        motion_blur_probability=0,
+        h264_probability=0,
+        view_tilt_probability=0,
+    )
+    assert out.shape == image.shape
+    assert flags == {"downscale": True, "motion_blur": False, "h264": False, "view_tilt": False}

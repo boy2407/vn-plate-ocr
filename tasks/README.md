@@ -22,3 +22,11 @@
 | 067 | Sync and run web demo on desktop | in progress | Codex | 2026-10-29 |
 | 068 | Route OCR demo through shared Nginx | done | Codex | 2026-10-30 |
 | 069 | Document OCR demo Nginx operations | done | Codex | 2026-10-30 |
+| 070 | Measure video plate box refinement | measurement done; awaiting integration decision | Codex | 2026-10-30 |
+| 071 | Measure refine on held-out cameras | done | Codex | 2026-10-30 |
+| 072 | Diagnose refinement fallback and validate proposals | stopped: original baseline mismatch | Codex | 2026-10-30 |
+| 073 | Train plate corner pose and evaluate rectified OCR | done | Codex | 2026-10-30 |
+| 074 | Score all pose warp margins from 1 to 5 percent | done | Codex | 2026-10-30 |
+| 075 | Score pose warp margins 6 and 7 percent | done | Codex | 2026-10-30 |
+| 076 | Calibrated rejection, per-char track voting, targeted training | Phases A–D done; E not started | Codex | 2026-10-30 |
+| 077 | Speed up the OCR demo on CPU | in progress | Claude | 2026-10-30 |

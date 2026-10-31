@@ -17,6 +17,7 @@ from custom_alpr.augment import (
     random_salt_pepper,
     random_view_tilt,
 )
+from custom_alpr.train_custom_ocr import distillation_terms
 from custom_alpr.custom_ocr import (
     BOS_INDEX,
     EOS_INDEX,
@@ -117,6 +118,12 @@ def test_parseq_trains_and_generates():
     texts, confidences = model.generate_with_confidence(images)
     assert len(texts) == len(confidences) == 2
     assert all(0.0 <= c <= 1.0 for c in confidences)
+    positioned_texts, positioned_confidences, probabilities = model.generate_with_confidence(
+        images, return_positions=True
+    )
+    assert positioned_texts == texts
+    assert positioned_confidences == confidences
+    assert probabilities.shape == (2, model.max_output_length - 1, model.classifier.out_features)
 
 
 def test_build_model_uses_checkpoint_decoder():
@@ -228,7 +235,7 @@ def test_h264_keeps_odd_sized_small_crops():
 
 
 def test_compression_applies_at_most_one_codec(monkeypatch):
-    import custom_alpr.augment as augment
+    from custom_alpr import augment
 
     calls = []
     monkeypatch.setattr(augment, "random_h264", lambda image, rng, probability: image + 1)
@@ -238,3 +245,21 @@ def test_compression_applies_at_most_one_codec(monkeypatch):
     image = np.zeros((8, 16, 3), dtype=np.uint8)
     assert augment.random_compression(image, np.random.default_rng(0))[0, 0, 0] == 1
     assert not calls
+
+
+def test_distillation_terms_skip_rows_without_clean_view():
+    torch.manual_seed(0)
+    student = PlateOCRParseq(max_output_length=8).eval()
+    teacher = PlateOCRParseq(max_output_length=8).eval()
+    images = torch.rand(2, 3, 64, 128)
+    memory = student.encode(images)
+    inputs = torch.tensor([[1, 5, 6, 7, 2, 0, 0], [1, 6, 7, 8, 2, 0, 0]])
+    targets = torch.tensor([[1, 5, 6, 7, 2, 0, 0, 0], [1, 6, 7, 8, 2, 0, 0, 0]])
+    none = torch.zeros(2, dtype=torch.bool)
+    mse, kl = distillation_terms(student, teacher, memory, inputs, targets, images, none, 2.0)
+    assert mse.item() == 0.0 and kl.item() == 0.0
+    both = torch.ones(2, dtype=torch.bool)
+    mse, kl = distillation_terms(student, teacher, memory, inputs, targets, images, both, 2.0)
+    assert mse.item() > 0.0 and kl.item() >= 0.0
+    same, _ = distillation_terms(student, student, memory, inputs, targets, images, both, 2.0)
+    assert same.item() < 1e-9

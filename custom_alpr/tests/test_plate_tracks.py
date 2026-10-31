@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from custom_alpr.plate_tracks import PlateTracker, group_observations
+from custom_alpr.plate_tracks import PlateTracker, group_observations, per_character_vote
 
 
 def observation(text="51H21510", time=0, box=None, confidence=0.9, crop="crop.png"):
@@ -139,6 +139,7 @@ def test_review_page_and_csv_regroup_raw_observations(tmp_path):
     assert raw[2]["text"] == "30A12345" and raw[2]["ocr_confidence"] == 0.99
     assert json.loads((folder / "results.json").read_text())[0]["text"] == "51H21510"
 
+
 def test_yolo_track_id_keeps_one_track_across_a_jump_iou_would_split():
     tracker = PlateTracker()
     first = observation(time=0, box=[10, 20, 110, 70])
@@ -170,3 +171,71 @@ def test_saved_plates_match_the_review_grouping(tmp_path):
     saved = json.loads((tmp_path / "plates.json").read_text(encoding="utf-8"))
     assert len(plates) == len(saved) == 1
     assert saved[0]["text_votes"] == 3
+
+
+def _char_distribution(char, wrong=None):
+    alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZĐ"
+    probs = [0.001] * len(alphabet)
+    probs[alphabet.index(char)] = 0.9 if wrong is None else 0.2
+    if wrong is not None:
+        probs[alphabet.index(wrong)] = 0.75
+    return probs
+
+
+def _char_observation(text, evidence_text=None, wrong_position=None, wrong_char=None, quality=1.0):
+    evidence_text = evidence_text or text
+    return {
+        "text": text,
+        "quality": quality,
+        "char_probabilities": [
+            _char_distribution(char, wrong_char if index == wrong_position else None)
+            for index, char in enumerate(evidence_text)
+        ],
+    }
+
+
+def test_per_character_vote_recovers_plate_with_distinct_single_digit_errors():
+    truth = "30A12345"
+    rows = [
+        _char_observation("80A12345", "30A12345", 0, "8"),
+        _char_observation("30A92345", "30A12345", 3, "9"),
+        _char_observation("30A12305", "30A12345", 6, "0"),
+    ]
+    result = per_character_vote(rows)
+    assert result["text"] == truth
+    assert result["accepted"]
+
+    tracker = PlateTracker()
+    for time, row in enumerate(rows):
+        item = observation(row["text"], time=time / 10)
+        item.update(quality=row["quality"], char_probabilities=row["char_probabilities"])
+        tracker.observe(item)
+    assert tracker.summaries()[0]["text"] == "80A12345"  # string vote remains the default
+    assert tracker.summaries(vote_strategy="per_character")[0]["text"] == truth
+
+
+def test_per_character_vote_uses_dominant_length_and_layout():
+    rows = [
+        _char_observation("30A12345"),
+        _char_observation("30A12345"),
+        _char_observation("30A1234"),
+    ]
+    result = per_character_vote(rows)
+    assert result["text"] == "30A12345"
+    assert result["observations"] == 2
+
+
+def test_per_character_vote_rejects_low_posterior_margin():
+    probabilities = [[0.05] * 37 for _ in "30A12345"]
+    row = {"text": "30A12345", "quality": 1.0, "char_probabilities": probabilities}
+    result = per_character_vote([row], rejection_threshold=0.1)
+    assert result["text"] == "unreadable"
+    assert not result["accepted"]
+
+
+def test_per_character_rejection_without_probabilities_is_unreadable():
+    row = {"text": "30A12345", "ocr_confidence": 0.9}
+    result = per_character_vote([row], rejection_threshold=0.1)
+    assert result["text"] == "unreadable"
+    assert result["candidate_text"] == "30A12345"
+    assert not result["accepted"]

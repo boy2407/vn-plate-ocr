@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from math import hypot
+from math import exp, hypot, log
 import re
 
 # Civil (incl. 2-letter series, motorbike "29B1", "MĐ1") and 2-letter military plates.
 PLATE_FORMAT = re.compile(r"^(?:\d{2}[A-ZĐ]{1,2}\d?\d{4,5}|[A-Z]{2}\d{4,5})$")
+VOTE_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZĐ"
 
 
 def normalized_text(text: str) -> str:
@@ -30,6 +31,79 @@ def representative_key(item: dict) -> tuple:
     quality = item.get("crop_quality", {}).get("score")
     score = confidence if quality is None else 0.65 * quality + 0.35 * confidence
     return (score, confidence, item["width"] * item["height"], item["detection_confidence"])
+
+
+def predicted_layout(text: str) -> str:
+    return "".join("D" if char.isdigit() else "L" for char in normalized_text(text))
+
+
+def per_character_vote(observations: list[dict], rejection_threshold: float | None = None) -> dict:
+    """Vote per character within the dominant predicted layout using crop quality only.
+
+    Each observation may carry ``char_probabilities`` as one vocabulary-probability
+    vector per predicted position. The confidence is the minimum top-two posterior
+    margin over positions, so one weak character can reject the whole track.
+    """
+    if not observations:
+        raise ValueError("A character vote needs at least one observation")
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for item in observations:
+        text = normalized_text(item["text"])
+        layout = item.get("layout") or predicted_layout(text)
+        if text and len(layout) == len(text):
+            groups[layout].append(item)
+    if not groups:
+        return {"text": "unreadable", "confidence": 0.0, "layout": "", "accepted": False}
+    layout = max(groups, key=lambda value: (len(groups[value]), value))
+    selected = groups[layout]
+    output, margins = [], []
+    for position, kind in enumerate(layout):
+        totals: dict[str, float] = defaultdict(float)
+        for item in selected:
+            probabilities = item.get("char_probabilities")
+            if probabilities is None or position >= len(probabilities):
+                continue
+            weight = item.get("quality")
+            if weight is None:
+                weight = item.get("crop_quality", {}).get("score", 1.0)
+            weight = max(float(weight or 0.0), 0.0)
+            vector = probabilities[position]
+            for index, probability in enumerate(vector[: len(VOTE_ALPHABET)]):
+                char = VOTE_ALPHABET[index]
+                if (kind == "D") != char.isdigit():
+                    continue
+                totals[char] += weight * log(max(float(probability), 1e-12))
+        if not totals:
+            # Old observations remain usable, but have no calibrated character evidence.
+            text = max(selected, key=vote_weight)["text"]
+            candidate = normalized_text(text)
+            accepted = rejection_threshold is None
+            return {
+                "text": candidate if accepted else "unreadable",
+                "candidate_text": candidate,
+                "confidence": 0.0,
+                "layout": layout,
+                "accepted": accepted,
+            }
+        ranked = sorted(totals.items(), key=lambda pair: (-pair[1], pair[0]))
+        output.append(ranked[0][0])
+        normalization = sum(exp(score - ranked[0][1]) for _, score in ranked)
+        margins.append(
+            (exp(ranked[0][1] - ranked[0][1]) - exp(ranked[1][1] - ranked[0][1])) / normalization
+            if len(ranked) > 1
+            else 1.0
+        )
+    confidence = min(margins, default=0.0)
+    text = "".join(output)
+    accepted = rejection_threshold is None or confidence >= rejection_threshold
+    return {
+        "text": text if accepted else "unreadable",
+        "candidate_text": text,
+        "confidence": confidence,
+        "layout": layout,
+        "accepted": accepted,
+        "observations": len(selected),
+    }
 
 
 def association_score(a: list, b: list) -> float:
@@ -62,11 +136,13 @@ class PlateTrack:
     counts: dict = field(default_factory=lambda: defaultdict(int))
     weights: dict = field(default_factory=lambda: defaultdict(float))
     best: dict = field(default_factory=dict)
+    items: list[dict] = field(default_factory=list)
 
     def add(self, item: dict):
         text = normalized_text(item["text"])
         item["track_id"] = self.track_id
         self.observations += 1
+        self.items.append(item.copy())
         self.counts[text] += 1
         self.weights[text] += vote_weight(item)
         if text not in self.best or representative_key(item) > representative_key(self.best[text]):
@@ -74,8 +150,28 @@ class PlateTrack:
         self.box = item["box"]
         self.last_time = item["time_seconds"]
 
-    def summary(self) -> dict:
+    def summary(
+        self, *, vote_strategy: str = "string", rejection_threshold: float | None = None
+    ) -> dict:
         """Vote over the whole track: well-formed plates first, then quality-weighted votes."""
+        if vote_strategy == "per_character":
+            voted = per_character_vote(self.items, rejection_threshold)
+            item = max(self.items, key=representative_key).copy()
+            item.update(
+                text=voted["text"],
+                per_character_candidate_text=voted.get("candidate_text", voted["text"]),
+                per_character_confidence=voted["confidence"],
+                vote_strategy=vote_strategy,
+                plate_format_valid=valid_plate(voted.get("candidate_text", voted["text"])),
+                observations=self.observations,
+                first_time=self.first_time,
+                last_time=self.last_time,
+                track_ids=[self.track_id],
+                track_count=1,
+            )
+            return item
+        if vote_strategy != "string":
+            raise ValueError("vote_strategy must be 'string' or 'per_character'")
         text = max(
             self.counts,
             key=lambda value: (valid_plate(value), self.weights[value], self.counts[value]),
@@ -157,10 +253,17 @@ class PlateTracker:
             summaries.append(track.summary())
         return summaries
 
-    def summaries(self) -> list[dict]:
+    def summaries(
+        self, *, vote_strategy: str = "string", rejection_threshold: float | None = None
+    ) -> list[dict]:
+        if vote_strategy == "per_character":
+            return [
+                track.summary(vote_strategy=vote_strategy, rejection_threshold=rejection_threshold)
+                for track in self.tracks
+            ]
         grouped = {}
         for track in self.tracks:
-            item = track.summary()
+            item = track.summary(vote_strategy=vote_strategy)
             text = normalized_text(item["text"])
             key = text or f"empty-track-{track.track_id}"
             if key not in grouped:
@@ -182,11 +285,16 @@ class PlateTracker:
         return sorted(grouped.values(), key=lambda item: item["first_time"])
 
 
-def group_observations(observations: list[dict]) -> list[dict]:
+def group_observations(
+    observations: list[dict],
+    *,
+    vote_strategy: str = "string",
+    rejection_threshold: float | None = None,
+) -> list[dict]:
     tracker = PlateTracker()
     frames = defaultdict(list)
     for item in observations:
         frames[(item["time_seconds"], item["frame"])].append(item)
     for key in sorted(frames):
         tracker.observe_frame(frames[key])
-    return tracker.summaries()
+    return tracker.summaries(vote_strategy=vote_strategy, rejection_threshold=rejection_threshold)

@@ -17,12 +17,14 @@ from custom_alpr.custom_ocr import (
     PAD_INDEX,
     PlateOCR2D,
     PlateOCRParseq,
+    permutation_attention_mask,
     sequence_loss,
 )
 from custom_alpr.custom_ocr_data import (
     PlateOCRDataset,
     RepeatFactorSampler,
     plate_ocr_collate,
+    plate_ocr_distill_collate,
     rare_letter_repeat_factors,
 )
 
@@ -93,6 +95,19 @@ def parse_args() -> argparse.Namespace:
         default="val_loss",
         help="validation metric for checkpoint selection, LR plateau, and early stopping",
     )
+    parser.add_argument(
+        "--distill-teacher",
+        type=Path,
+        help="frozen teacher checkpoint reading the clean image; the student reads the augmented "
+        "one and its encoder features are pulled toward the teacher's (parseq only)",
+    )
+    parser.add_argument(
+        "--distill-weight", type=float, default=0.0, help="weight of the encoder-feature MSE"
+    )
+    parser.add_argument(
+        "--distill-kl", type=float, default=0.0, help="weight of the output KL (left-to-right)"
+    )
+    parser.add_argument("--distill-temperature", type=float, default=2.0)
     parser.add_argument("--max-train-batches", type=int)
     parser.add_argument("--max-val-batches", type=int)
     parser.add_argument("--max-test-batches", type=int)
@@ -105,6 +120,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("learning-rate must be positive and weight-decay cannot be negative")
     if not 0 <= args.label_smoothing < 1 or args.warmup_epochs < 0:
         parser.error("label-smoothing must be in [0, 1) and warmup-epochs cannot be negative")
+    if args.distill_weight < 0 or args.distill_kl < 0 or args.distill_temperature <= 0:
+        parser.error("distill weights must be non-negative and the temperature positive")
+    if (args.distill_weight or args.distill_kl) and not args.distill_teacher:
+        parser.error("--distill-weight/--distill-kl need --distill-teacher")
+    if args.distill_teacher and args.decoder != "parseq":
+        parser.error("distillation is implemented for the parseq decoder only")
     if args.max_output_length < 2:
         parser.error("max-output-length must allow at least BOS and EOS")
     if any(
@@ -113,6 +134,37 @@ def parse_args() -> argparse.Namespace:
     ):
         parser.error("batch limits must be positive when provided")
     return args
+
+
+def distillation_terms(
+    student: PlateOCRParseq,
+    teacher: PlateOCRParseq,
+    student_memory: torch.Tensor,
+    decoder_inputs: torch.Tensor,
+    target_ids: torch.Tensor,
+    clean: torch.Tensor,
+    has_clean: torch.Tensor,
+    temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Feature MSE and output KL against a frozen teacher; rows without a clean view are skipped."""
+    zero = student_memory.new_zeros(())
+    if not has_clean.any():
+        return zero, zero
+    with torch.no_grad():
+        teacher_memory = teacher.encode(clean)
+    mse = torch.nn.functional.mse_loss(student_memory[has_clean], teacher_memory[has_clean])
+    order = torch.arange(decoder_inputs.shape[1], device=decoder_inputs.device)
+    mask = permutation_attention_mask(order)
+    student_logits = student.decode_positions(student_memory, decoder_inputs, mask)
+    with torch.no_grad():
+        teacher_logits = teacher.decode_positions(teacher_memory, decoder_inputs, mask)
+    valid = target_ids[:, 1:].ne(PAD_INDEX) & has_clean[:, None]
+    kl = torch.nn.functional.kl_div(
+        (student_logits[valid] / temperature).log_softmax(dim=-1),
+        (teacher_logits[valid] / temperature).softmax(dim=-1),
+        reduction="batchmean",
+    ) * temperature**2
+    return mse, kl
 
 
 def choose_device(requested: str) -> torch.device:
@@ -261,6 +313,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         strong_downscale=args.strong_downscale,
         view_tilt=args.view_tilt,
         compression=args.compression_augment,
+        return_clean=args.distill_teacher is not None,
         seed=args.seed,
     )
     val_dataset = PlateOCRDataset(args.val, seed=args.seed)
@@ -274,6 +327,9 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         "persistent_workers": args.workers > 0,
         "worker_init_fn": initialize_worker,
     }
+    train_options = dict(loader_options)
+    if args.distill_teacher:
+        train_options["collate_fn"] = plate_ocr_distill_collate
     if args.balance_rare_letters:
         factors, rare = rare_letter_repeat_factors([text for _, text in train_dataset.samples])
         sampler = RepeatFactorSampler(factors, generator=generator)
@@ -281,10 +337,10 @@ def main() -> None:  # noqa: PLR0912, PLR0915
             f"Rare-letter repeats: letters {''.join(sorted(rare))}; "
             f"{len(sampler)} crops per epoch instead of {len(factors)}"
         )
-        train_loader = DataLoader(train_dataset, sampler=sampler, **loader_options)
+        train_loader = DataLoader(train_dataset, sampler=sampler, **train_options)
     else:
         train_loader = DataLoader(
-            train_dataset, shuffle=True, generator=generator, **loader_options
+            train_dataset, shuffle=True, generator=generator, **train_options
         )
     val_loader = DataLoader(val_dataset, shuffle=False, **loader_options)
     test_loader = DataLoader(test_dataset, shuffle=False, **loader_options)
@@ -298,6 +354,18 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         model.load_state_dict(initial["model_state_dict"])
         print(f"Initialized from {args.init_checkpoint} (epoch {initial.get('epoch')})")
     model = model.to(device)
+    teacher = None
+    if args.distill_teacher:
+        teacher = PlateOCRParseq(max_output_length=args.max_output_length)
+        teacher_state = torch.load(args.distill_teacher, map_location="cpu", weights_only=True)
+        teacher.load_state_dict(teacher_state["model_state_dict"])
+        teacher = teacher.to(device).eval()
+        for parameter in teacher.parameters():
+            parameter.requires_grad_(False)
+        print(
+            f"Distilling from {args.distill_teacher}: mse={args.distill_weight} "
+            f"kl={args.distill_kl} T={args.distill_temperature}"
+        )
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
     )
@@ -332,11 +400,10 @@ def main() -> None:  # noqa: PLR0912, PLR0915
             model.train()
             loss_total = 0.0
             token_count = 0
-            for batch_index, (batch_images, batch_inputs, batch_targets, _) in enumerate(
-                train_loader
-            ):
+            for batch_index, batch in enumerate(train_loader):
                 if args.max_train_batches is not None and batch_index >= args.max_train_batches:
                     break
+                batch_images, batch_inputs, batch_targets = batch[:3]
                 images = batch_images.to(device)
                 decoder_inputs = batch_inputs.to(device)
                 target_ids = batch_targets.to(device)
@@ -345,7 +412,17 @@ def main() -> None:  # noqa: PLR0912, PLR0915
                         group["lr"] = args.learning_rate * (step + 1) / warmup_steps
                 step += 1
                 optimizer.zero_grad(set_to_none=True)
-                if isinstance(model, PlateOCRParseq):
+                if teacher is not None:
+                    memory = model.encode(images)
+                    loss = model.permutation_loss(
+                        images, decoder_inputs, target_ids, args.label_smoothing, memory=memory
+                    )
+                    mse, kl = distillation_terms(
+                        model, teacher, memory, decoder_inputs, target_ids,
+                        batch[4].to(device), batch[5].to(device), args.distill_temperature,
+                    )  # fmt: skip
+                    loss = loss + args.distill_weight * mse + args.distill_kl * kl
+                elif isinstance(model, PlateOCRParseq):
                     loss = model.permutation_loss(
                         images, decoder_inputs, target_ids, args.label_smoothing
                     )
@@ -418,6 +495,9 @@ def main() -> None:  # noqa: PLR0912, PLR0915
                         "view_tilt": args.view_tilt,
                         "compression_augment": args.compression_augment,
                         "balance_rare_letters": args.balance_rare_letters,
+                        "distill_teacher": str(args.distill_teacher or ""),
+                        "distill_weight": args.distill_weight,
+                        "distill_kl": args.distill_kl,
                         "model_config": {
                             "max_output_length": args.max_output_length,
                             "image_height": 64,

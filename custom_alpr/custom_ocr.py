@@ -371,9 +371,15 @@ class PlateOCRParseq(PlateOCR2D):
         decoder_input_ids: Tensor,
         target_ids: Tensor,
         label_smoothing: float = 0.0,
+        memory: Tensor | None = None,
     ) -> Tensor:
-        """Mean cross-entropy over left-to-right, right-to-left, and random orders."""
-        memory = self.encode(images)
+        """Mean cross-entropy over left-to-right, right-to-left, and random orders.
+
+        Pass ``memory`` (from ``encode(images)``) to reuse the visual features, e.g. when
+        the caller also needs them for a feature-distillation loss.
+        """
+        if memory is None:
+            memory = self.encode(images)
         length = decoder_input_ids.shape[1]
         device = decoder_input_ids.device
         orders = [torch.arange(length, device=device)]
@@ -392,12 +398,18 @@ class PlateOCRParseq(PlateOCR2D):
 
     @torch.inference_mode()
     def generate_with_confidence(
-        self, images: Tensor, max_output_length: int | None = None
-    ) -> tuple[list[str], list[float]]:
+        self,
+        images: Tensor,
+        max_output_length: int | None = None,
+        layout: bool = False,
+        *,
+        return_positions: bool = False,
+    ) -> tuple[list[str], list[float]] | tuple[list[str], list[float], Tensor]:
         """Decode left to right, refine with a cloze mask, and score each plate.
 
         Confidence is the geometric mean probability of the final character tokens
-        (EOS excluded), the same definition used for PlateOCR2D.
+        (EOS excluded), the same definition used for PlateOCR2D. With ``layout`` the
+        refined per-position probabilities are read through ``layout_decode``.
         """
         max_length = max_output_length or self.max_output_length
         if max_length > self.max_output_length:
@@ -419,16 +431,64 @@ class PlateOCRParseq(PlateOCR2D):
         for _ in range(self.refine_iterations):
             context = context_from_prediction(logits.argmax(dim=-1))
             logits = self.decode_positions(memory, context, cloze)
-        probabilities, predicted = logits.softmax(dim=-1).max(dim=-1)
+        position_probabilities = logits.softmax(dim=-1)
+        if layout:
+            decoded = layout_decode(position_probabilities)
+            return (*decoded, position_probabilities) if return_positions else decoded
+        probabilities, predicted = position_probabilities.max(dim=-1)
         ended = predicted.eq(EOS_INDEX).cumsum(dim=1) > 0
         characters = (~ended) & (predicted >= 3)
         log_sum = torch.where(characters, probabilities.clamp_min(1e-12).log(), 0.0).sum(dim=1)
         counts = characters.sum(dim=1)
         scores = torch.where(counts > 0, (log_sum / counts.clamp_min(1)).exp(), 0.0)
-        return decode_targets(predicted), scores.detach().cpu().tolist()
+        decoded = decode_targets(predicted), scores.detach().cpu().tolist()
+        return (*decoded, position_probabilities) if return_positions else decoded
 
-    def generate(self, images: Tensor, max_output_length: int | None = None) -> list[str]:
-        return self.generate_with_confidence(images, max_output_length)[0]
+    def generate(
+        self, images: Tensor, max_output_length: int | None = None, layout: bool = False
+    ) -> list[str]:
+        return self.generate_with_confidence(images, max_output_length, layout)[0]
+
+
+# Digit (D) / letter (L) layouts of the Kaggle train labels seen at least 5 times;
+# every test label fits one. 30F11292, 89LD00275, KP4790, 60737HR, 13267G9, ...
+PLATE_LAYOUTS = (
+    "DDLDDDDD", "DDLLDDDDD", "DDLDDDDDD", "LLDDDD", "DDLDDDD",
+    "DDLLDDDDDD", "DDLLDDDD", "DDDDDLL", "DDDDDLD", "DDDDDL",
+)  # fmt: skip
+DIGIT_IDS = slice(3, 13)  # decoder ids of "0".."9"
+LETTER_IDS = slice(13, DECODER_VOCAB_SIZE)  # "A".."Z", "Đ"
+
+
+def layout_decode(probabilities: Tensor) -> tuple[list[str], list[float]]:
+    """Most probable text that fits one of ``PLATE_LAYOUTS``, with its confidence.
+
+    ``probabilities`` is ``[batch, positions, vocab]``. Each layout scores the best
+    digit or letter at every position plus EOS right after it, so a digit can never
+    be read as a letter (0/D, 8/B, 5/S, 2/Z) or the other way round.
+    """
+    log_p = probabilities.clamp_min(1e-12).log()
+    digit_score, digit_id = log_p[..., DIGIT_IDS].max(dim=-1)
+    letter_score, letter_id = log_p[..., LETTER_IDS].max(dim=-1)
+    digit_id, letter_id = digit_id + DIGIT_IDS.start, letter_id + LETTER_IDS.start
+    layouts = [layout for layout in PLATE_LAYOUTS if len(layout) < log_p.shape[1]]
+    scores = []
+    for layout in layouts:
+        is_letter = torch.tensor([c == "L" for c in layout], device=log_p.device)
+        n = len(layout)
+        chars = torch.where(is_letter, letter_score[:, :n], digit_score[:, :n]).sum(dim=1)
+        scores.append(chars + log_p[:, n, EOS_INDEX])
+    best = torch.stack(scores, dim=1).argmax(dim=1).tolist()
+    texts, confidences = [], []
+    for row, choice in enumerate(best):
+        layout = layouts[choice]
+        ids = [
+            int(letter_id[row, i] if c == "L" else digit_id[row, i]) for i, c in enumerate(layout)
+        ]
+        texts.append("".join(DECODER_INDEX_TO_CHAR[i] for i in ids))
+        chosen = log_p[row, torch.arange(len(ids)), torch.tensor(ids)]
+        confidences.append(float(chosen.mean().exp()))
+    return texts, confidences
 
 
 def context_from_prediction(predicted: Tensor) -> Tensor:

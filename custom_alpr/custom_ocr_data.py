@@ -45,9 +45,11 @@ class PlateOCRDataset(Dataset):
         strong_downscale: bool = False,
         view_tilt: bool = False,
         compression: bool = False,
+        return_clean: bool = False,
         seed: int = 0,
     ):
         self.manifest = manifest
+        self.return_clean = return_clean
         self.augment = augment
         self.noise = noise
         self.blue_plate = blue_plate
@@ -59,6 +61,8 @@ class PlateOCRDataset(Dataset):
         self.samples: list[tuple[Path, str]] = []
         # Renders and synthetic plates are drawn straight; real crops are measured once.
         self.straight: list[bool | None] = []
+        # Synthetic-v2 images are stored already degraded: no clean view to distill from.
+        self.has_clean: list[bool] = []
         with manifest.open(encoding="utf-8", newline="") as manifest_file:
             reader = csv.DictReader(manifest_file)
             if not {"image_path", "plate_text"} <= set(reader.fieldnames or []):
@@ -75,13 +79,14 @@ class PlateOCRDataset(Dataset):
                 self.samples.append((image_path, text))
                 clean = row.get("source") in {"generated", "synthetic"}
                 self.straight.append(True if clean else None)
+                self.has_clean.append(row.get("source") != "synthetic")
         if not self.samples:
             raise ValueError(f"{manifest}: no labeled samples")
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> tuple[Tensor, Tensor, str]:
+    def __getitem__(self, index: int):
         image_path, text = self.samples[index]
         try:
             with Image.open(image_path) as image_file:
@@ -91,6 +96,7 @@ class PlateOCRDataset(Dataset):
                 pixels = np.asarray(image, dtype=np.uint8).copy()
         except OSError as error:
             raise ValueError(f"Cannot decode image {image_path}") from error
+        clean_pixels = pixels.copy() if self.return_clean else None
         if self.augment:
             if self.view_tilt:  # replaces the milder rotation of run D; straight plates only
                 if self.straight[index] is None:
@@ -117,6 +123,9 @@ class PlateOCRDataset(Dataset):
                 pixels = random_compression(pixels, self.rng)
         image_tensor = torch.from_numpy(pixels).permute(2, 0, 1).float().div_(255.0)
         target = torch.tensor(encode_target(text), dtype=torch.long)
+        if clean_pixels is not None:
+            clean_tensor = torch.from_numpy(clean_pixels).permute(2, 0, 1).float().div_(255.0)
+            return image_tensor, target, text, clean_tensor, self.has_clean[index]
         return image_tensor, target, text
 
 
@@ -179,3 +188,13 @@ def plate_ocr_collate(
         target_ids[row, : target.shape[0]] = target
     decoder_input_ids = target_ids[:, :-1]
     return torch.stack(images), decoder_input_ids, target_ids, list(texts)
+
+
+def plate_ocr_distill_collate(
+    samples: list[tuple[Tensor, Tensor, str, Tensor, bool]],
+) -> tuple[Tensor, Tensor, Tensor, list[str], Tensor, Tensor]:
+    """Like ``plate_ocr_collate`` plus the un-augmented images and a has-clean mask."""
+    images, decoder_inputs, target_ids, texts = plate_ocr_collate([s[:3] for s in samples])
+    clean = torch.stack([s[3] for s in samples])
+    has_clean = torch.tensor([s[4] for s in samples], dtype=torch.bool)
+    return images, decoder_inputs, target_ids, texts, clean, has_clean
