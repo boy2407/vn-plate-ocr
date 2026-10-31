@@ -11,7 +11,8 @@ function showMedia(url, kind) {
   mediaArea.replaceChildren(media);
 }
 $('confidence').addEventListener('input', e => $('conf-value').textContent = Number(e.target.value).toFixed(2));
-function busy(state) { for (const id of ['submit','confidence','denoise','sharpen','padding','rectify','image-size','min-height','youtube-url','youtube-seconds','result-view']) $(id).disabled = state; }
+function busy(state) { for (const id of ['submit','confidence','image-size','youtube-url','result-view']) $(id).disabled = state; for (const button of document.querySelectorAll('.example')) button.disabled = state; }
+for (const button of document.querySelectorAll('.example')) button.addEventListener('click', () => { $('youtube-url').value = button.dataset.url; $('youtube-url').focus(); });
 async function jsonFetch(url, options) {
   const response = await fetch(url, options);
   const data = await response.json();
@@ -33,8 +34,6 @@ function processingForm() {
   const form = new FormData();
   form.append('confidence', $('confidence').value);
   form.append('image_size', $('image-size').value);
-  form.append('min_height', $('min-height').value);
-  for (const name of ['denoise', 'sharpen', 'padding', 'rectify']) form.append(name, $(name).checked ? '1' : '0');
   return form;
 }
 function processingLabel(options = {}) {
@@ -48,7 +47,7 @@ $('youtube-form').addEventListener('submit', e => {
   e.preventDefault();
   const url = $('youtube-url').value.trim();
   if (!url) return error('Hãy dán link YouTube.');
-  const form = processingForm(); form.append('url', url); form.append('max_seconds', $('youtube-seconds').value);
+  const form = processingForm(); form.append('url', url);
   start('/api/youtube', form);
 });
 $('stop').addEventListener('click', async () => {
@@ -64,9 +63,7 @@ async function poll(id) {
     $('phase').textContent = job.phase;
     if (!settingsShown) {
       $('image-size').value = job.image_size || 640;
-      $('min-height').value = job.min_height ?? 16;
       $('confidence').value = job.confidence; $('conf-value').textContent = Number(job.confidence).toFixed(2);
-      for (const name of ['denoise', 'sharpen', 'padding', 'rectify']) $(name).checked = Boolean(job.preprocessing?.[name]);
       settingsShown = true;
     }
     if (job.kind === 'video' && !streamAttached && !['done', 'error'].includes(job.status)) {
@@ -82,6 +79,8 @@ async function poll(id) {
       $('source-fps').textContent = Number(job.source_fps).toFixed(1);
       $('inference-fps').textContent = `${job.inference_fps} fps`;
       $('frame-ms').textContent = `${job.frame_ms} ms`;
+      const stages = job.stage_ms || {};
+      $('stage-ms').textContent = `YOLO ${stages.detector ?? '—'} · pose ${stages.pose ?? '—'} · OCR ${stages.ocr ?? '—'} ms`;
       $('skipped-frames').textContent = job.skipped_frames;
       $('summary').textContent = `${timeLabel(job.time_seconds)} · frame ${job.latest_frame} · ${job.live_fps} FPS cập nhật`;
       $('live-crop-pair').hidden = !job.latest;
@@ -90,7 +89,7 @@ async function poll(id) {
         $('live-crop-image').src = `/media/${id}/${item.crop}`;
         $('live-input-image').src = `/media/${id}/${item.ocr_input}`;
         $('live-plate-text').textContent = item.text || '(chuỗi trống)';
-        $('live-plate-meta').textContent = `Frame ${item.frame} · ${timeLabel(item.time_seconds)} · ${item.width} × ${item.height} px · YOLO ${(item.detection_confidence*100).toFixed(1)}% · OCR ${(item.ocr_confidence*100).toFixed(1)}% · ${item.padding ? "viền 5% · " : ""}${item.rectified ? "đã nắn thẳng · " : ""}${processingLabel(item.preprocessing)}`;
+        $('live-plate-meta').textContent = `Frame ${item.frame} · ${timeLabel(item.time_seconds)} · ${item.width} × ${item.height} px · YOLO ${(item.detection_confidence*100).toFixed(1)}% · OCR ${(item.ocr_confidence*100).toFixed(1)}% · ${item.pose_warped ? "nắn phẳng 4 góc · " : ""}${item.padding ? "viền 5% · " : ""}${item.rectified ? "đã nắn thẳng · " : ""}${processingLabel(item.preprocessing)}`;
         $('live-crop').onclick = $('live-input').onclick = () => openCrop(item);
       } else {
         $('live-plate-text').textContent = 'Không có box qua ngưỡng';
@@ -124,7 +123,7 @@ function openCrop(item) {
   $('processed-figure').hidden = !item.ocr_input;
   if (item.ocr_input) $('zoom-input-image').src = `/media/${currentJob}/${item.ocr_input}`;
   $('zoom-text').textContent = item.text || '(chuỗi trống)';
-  $('zoom-meta').textContent = `Crop gốc ${item.width} × ${item.height} px · YOLO ${(item.detection_confidence*100).toFixed(1)}% · OCR ${(item.ocr_confidence*100).toFixed(1)}% · Frame ${item.frame} · ${timeLabel(item.time_seconds)} · ${item.padding ? "viền 5% · " : ""}${item.rectified ? "đã nắn thẳng · " : ""}${processingLabel(item.preprocessing)}${item.observations ? ` · ${item.observations} lần quan sát · đồng thuận ${(item.text_agreement*100).toFixed(0)}%` : ''}`;
+  $('zoom-meta').textContent = `Crop gốc ${item.width} × ${item.height} px · YOLO ${(item.detection_confidence*100).toFixed(1)}% · OCR ${(item.ocr_confidence*100).toFixed(1)}% · Frame ${item.frame} · ${timeLabel(item.time_seconds)} · ${item.pose_warped ? "nắn phẳng 4 góc · " : ""}${item.padding ? "viền 5% · " : ""}${item.rectified ? "đã nắn thẳng · " : ""}${processingLabel(item.preprocessing)}${item.observations ? ` · ${item.observations} lần quan sát · đồng thuận ${(item.text_agreement*100).toFixed(0)}%` : ''}`;
   $('seek').hidden = !mediaArea.querySelector('video'); $('crop-dialog').showModal();
 }
 async function loadPage() {

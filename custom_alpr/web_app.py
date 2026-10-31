@@ -1,4 +1,4 @@
-"""Local website that reads plates from YouTube links with YOLO and PARSeq model F."""
+"""Local website that reads plates from YouTube links with YOLO and PARSeq model E-v1."""
 
 from __future__ import annotations
 
@@ -22,8 +22,16 @@ import numpy as np
 from flask import Flask, Response, jsonify, request, send_from_directory
 from ultralytics import YOLO
 
+from custom_alpr.plate_pose import (
+    POSE_CONFIDENCE,
+    WARP_MARGIN,
+    corner_box,
+    match_corners,
+    warp_plate,
+)
 from custom_alpr.preprocessing import crop_quality, padded_box, prepare_ocr_input, rectify_plate
 from custom_alpr.plate_tracks import PlateTracker, group_observations
+from custom_alpr.yolo_export import prefer_openvino
 from custom_alpr.video_demo import (
     DEFAULT_DETECTOR,
     DEFAULT_OCR,
@@ -38,6 +46,8 @@ from custom_alpr.video_demo import (
 )
 
 OUTPUT = ROOT / "custom_alpr/outputs/web-demo"
+# YOLOv8n-pose, four plate corners (task073); trained on the Kaggle polygons only.
+DEFAULT_POSE = ROOT / "custom_alpr/outputs/pose-073/best.pt"
 DEFAULT_MIN_HEIGHT = 16
 # Input of the TensorRT export (FP32): a 16:9 frame at imgsz 640. On a 1080p clip it
 # gave the same 1371 boxes as best.pt at 2.6 ms vs 7.0 ms per frame.
@@ -49,9 +59,14 @@ class InferenceEngine:
 
     fixed_size: tuple[int, int] | None = None
 
-    def __init__(self, detector: Path, ocr: Path, device: str):
+    def __init__(self, detector: Path, ocr: Path, device: str, pose: Path | None = None):
         self.device, self.yolo_device = resolve_device(device)
         self.detector = YOLO(str(detector), task="detect")
+        self.pose = YOLO(str(pose), task="pose") if pose else None
+        if self.pose:
+            self.pose.predict(
+                np.zeros((360, 640, 3), dtype=np.uint8), device=self.yolo_device, verbose=False
+            )
         # A TensorRT engine has one fixed input; the 320/640 setting cannot apply.
         self.fixed_size = ENGINE_SHAPE if Path(detector).suffix == ".engine" else None
         self.recognizer = load_ocr(ocr, self.device)
@@ -76,7 +91,7 @@ class InferenceEngine:
             )
             self.warmed_sizes.add(image_size)
 
-    def recognize(
+    def recognize(  # noqa: PLR0913 -- one keyword per preprocessing option
         self,
         frame: np.ndarray,
         confidence: float,
@@ -85,6 +100,7 @@ class InferenceEngine:
         sharpen: bool = False,
         padding: bool = False,
         rectify: bool = False,
+        pose_warp: bool = False,
         image_size: int = 640,
         min_height: int = 0,
         track: bool = False,
@@ -92,7 +108,10 @@ class InferenceEngine:
         """OCR every detected plate; returns (results, boxes too small to read).
 
         With ``track`` YOLO's ByteTrack assigns IDs that persist across calls;
-        call ``reset_tracker`` before a new clip.
+        call ``reset_tracker`` before a new clip. With ``pose_warp`` a plate whose
+        four corners the pose model finds is read from the straightened crop, with
+        no padding, rectify or filters (as measured in task073); other plates keep
+        the options above.
         """
         options = dict(
             conf=confidence,
@@ -100,12 +119,16 @@ class InferenceEngine:
             verbose=False,
             imgsz=self.fixed_size or image_size,
         )
+        # Milliseconds per stage of the last call, for the live status panel.
+        self.stage_ms = {"detector": 0.0, "pose": 0.0, "ocr": 0.0}
+        started = time.perf_counter()
         if track:
             prediction = self.detector.track(
                 frame, persist=True, tracker="bytetrack.yaml", **options
             )[0]
         else:
             prediction = self.detector.predict(frame, **options)[0]
+        self.stage_ms["detector"] = (time.perf_counter() - started) * 1000
         height, width = frame.shape[:2]
         boxes = select_boxes(prediction.boxes, width, height, with_ids=True)
         # Below this height digits are a few pixels tall; OCR output is a guess.
@@ -113,29 +136,60 @@ class InferenceEngine:
         too_small = len(boxes) - len(readable)
         if not readable:
             return [], too_small
+        pose_boxes, pose_corners, corner_confidences = [], None, None
+        if pose_warp and self.pose:
+            started = time.perf_counter()
+            found = self.pose.predict(
+                frame, conf=POSE_CONFIDENCE, device=self.yolo_device, verbose=False, imgsz=640
+            )[0]
+            pose_boxes = found.boxes.xyxy.cpu().numpy().tolist()
+            pose_corners = found.keypoints.xy.cpu().numpy()
+            if found.keypoints.conf is not None:
+                corner_confidences = found.keypoints.conf.cpu().numpy()
+            self.stage_ms["pose"] = (time.perf_counter() - started) * 1000
         results, inputs = [], []
         for x1, y1, x2, y2, detection_confidence, yolo_track_id in readable:
-            crop_box = padded_box([x1, y1, x2, y2], width, height) if padding else [x1, y1, x2, y2]
-            cx1, cy1, cx2, cy2 = crop_box
-            crop = cv2.cvtColor(frame[cy1:cy2, cx1:cx2], cv2.COLOR_BGR2RGB)
-            rectified, corners = rectify_plate(crop) if rectify else (crop, None)
+            plate = match_corners([x1, y1, x2, y2], pose_boxes, pose_corners, corner_confidences)
+            warped = None
+            if plate is not None:
+                try:
+                    warped = cv2.cvtColor(warp_plate(frame, plate, WARP_MARGIN), cv2.COLOR_BGR2RGB)
+                except ValueError:  # degenerate or non-convex corners
+                    plate = None
+            if warped is not None:
+                crop_box = corner_box(plate, width, height)
+                crop, corners = warped, plate
+                model_input = prepare_ocr_input(warped)
+                options = {"denoise": False, "sharpen": False, "rectify": False}
+            else:
+                options = {"denoise": denoise, "sharpen": sharpen, "rectify": rectify}
+                crop_box = (
+                    padded_box([x1, y1, x2, y2], width, height) if padding else [x1, y1, x2, y2]
+                )
+                cx1, cy1, cx2, cy2 = crop_box
+                crop = cv2.cvtColor(frame[cy1:cy2, cx1:cx2], cv2.COLOR_BGR2RGB)
+                rectified, corners = rectify_plate(crop) if rectify else (crop, None)
+                model_input = prepare_ocr_input(rectified, denoise=denoise, sharpen=sharpen)
             # Prepared once: the same pixels go to the model and to the saved preview.
-            inputs.append(prepare_ocr_input(rectified, denoise=denoise, sharpen=sharpen))
+            inputs.append(model_input)
             results.append(
                 {
                     "box": [x1, y1, x2, y2],
                     "crop_box": crop_box,
-                    "padding": padding,
-                    "rectified": corners is not None,
+                    "padding": padding and warped is None,
+                    "pose_warped": warped is not None,
+                    "rectified": warped is None and corners is not None,
                     "plate_corners": corners,
                     "crop_quality": crop_quality(crop),
                     "detection_confidence": detection_confidence,
                     "yolo_track_id": yolo_track_id,
-                    "preprocessing": {"denoise": denoise, "sharpen": sharpen, "rectify": rectify},
+                    "preprocessing": options,
                 }
             )
         # One OCR call per frame, however many plates YOLO found.
+        started = time.perf_counter()
         recognized = ocr_arrays(inputs, self.recognizer, self.device)
+        self.stage_ms["ocr"] = (time.perf_counter() - started) * 1000
         for item, model_input, (text, score) in zip(results, inputs, recognized, strict=True):
             item.update(text=text, ocr_confidence=float(score), _ocr_input=model_input)
         return results, too_small
@@ -227,7 +281,18 @@ def export_mp4(raw: Path, output: Path, input_fps: float | None = None):
 
 
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
-MAX_LIVE_SECONDS = 600
+# The public demo runs on a shared CPU box, so every job gets the same fixed budget
+# and the full preprocessing chain; the page no longer offers these as options.
+LIVE_SECONDS = 60
+# Crops lower than this are counted but not read: the characters are a few pixels tall.
+LIVE_MIN_HEIGHT = 20
+PREPROCESSING = {
+    "denoise": True,
+    "sharpen": True,
+    "padding": True,
+    "rectify": True,
+    "pose_warp": True,
+}
 
 
 def youtube_url(value: str) -> str:
@@ -236,16 +301,6 @@ def youtube_url(value: str) -> str:
     if parsed.scheme not in {"http", "https"} or parsed.hostname not in YOUTUBE_HOSTS:
         raise ValueError("Chỉ hỗ trợ link youtube.com hoặc youtu.be.")
     return parsed.geturl()
-
-
-def live_seconds_setting(form) -> int:
-    try:
-        value = int(form.get("max_seconds", "60"))
-        if not 5 <= value <= MAX_LIVE_SECONDS:
-            raise ValueError
-    except ValueError as exc:
-        raise ValueError(f"Thời lượng phải từ 5 đến {MAX_LIVE_SECONDS} giây.") from exc
-    return value
 
 
 def resolve_stream(url: str) -> tuple[str, str]:
@@ -394,6 +449,9 @@ def process_stream(engine, job, folder, update, emit_frame, stop):  # noqa: PLR0
                 skipped_frames=max(0, number - processed),
                 too_small=too_small,
                 frame_ms=round(frame_seconds * 1000, 1),
+                stage_ms={
+                    name: round(ms, 1) for name, ms in getattr(engine, "stage_ms", {}).items()
+                },
                 inference_fps=round(processed / max(inference_seconds, 0.001), 1),
                 live_fps=round(processed / max(time.perf_counter() - started, 0.001), 1),
             )
@@ -444,6 +502,7 @@ def write_results(folder, results):
                 "padding",
                 "rectify_requested",
                 "rectified",
+                "pose_warped",
                 "track_id",
             ]
         )
@@ -463,6 +522,7 @@ def write_results(folder, results):
                     item.get("padding", False),
                     item.get("preprocessing", {}).get("rectify", False),
                     item.get("rectified", False),
+                    item.get("pose_warped", False),
                     item["track_id"],
                 ]
             )
@@ -486,16 +546,13 @@ def write_results(folder, results):
     return plates
 
 
-def inference_settings(form) -> tuple[float, dict, int]:
+def inference_settings(form) -> tuple[float, int]:
     try:
         confidence = float(form.get("confidence", "0.4"))
         if not math.isfinite(confidence) or not 0 <= confidence <= 1:
             raise ValueError
     except ValueError as exc:
         raise ValueError("Confidence phải từ 0 đến 1.") from exc
-    options = {name: form.get(name, "0") for name in ("denoise", "sharpen", "padding", "rectify")}
-    if any(value not in {"0", "1"} for value in options.values()):
-        raise ValueError("Tùy chọn tiền xử lý phải là 0 hoặc 1.")
     try:
         image_size = int(form.get("image_size", "640"))
         # Trained at 320; 960/1280 lost recall (0.97 -> 0.83) on validation.
@@ -503,22 +560,11 @@ def inference_settings(form) -> tuple[float, dict, int]:
             raise ValueError
     except ValueError as exc:
         raise ValueError("Độ phân giải YOLO phải là 320 hoặc 640.") from exc
-    return confidence, {name: value == "1" for name, value in options.items()}, image_size
-
-
-def min_height_setting(form) -> int:
-    """Crops shorter than this many source pixels are counted, not read."""
-    try:
-        value = int(form.get("min_height", str(DEFAULT_MIN_HEIGHT)))
-        if not 0 <= value <= 200:
-            raise ValueError
-    except ValueError as exc:
-        raise ValueError("Chiều cao crop tối thiểu phải từ 0 đến 200 px.") from exc
-    return value
+    return confidence, image_size
 
 
 def create_app(  # noqa: PLR0915 -- route registration for a small local application
-    detector=DEFAULT_DETECTOR, ocr=DEFAULT_OCR, device="auto", output=OUTPUT
+    detector=DEFAULT_DETECTOR, ocr=DEFAULT_OCR, device="auto", output=OUTPUT, pose=None
 ):
     app = Flask(__name__, static_folder="web", static_url_path="/static")
     output.mkdir(parents=True, exist_ok=True)
@@ -559,7 +605,7 @@ def create_app(  # noqa: PLR0915 -- route registration for a small local applica
         try:
             update(status="running", phase="Đang nạp và làm nóng mô hình")
             if not engines:
-                engines.append(InferenceEngine(detector, ocr, device))
+                engines.append(InferenceEngine(detector, ocr, device, pose))
             engines[0].warm_detector(job["image_size"])
             results = process_stream(engines[0], job, folder, update, emit_frame, stops[job_id])
             plates = write_results(folder, results)
@@ -594,7 +640,11 @@ def create_app(  # noqa: PLR0915 -- route registration for a small local applica
                 preprocessing=preprocessing,
                 image_size=image_size,
                 min_height=min_height,
-                models={"ocr_checkpoint": str(ocr), "detector_checkpoint": str(detector)},
+                models={
+                    "ocr_checkpoint": str(ocr),
+                    "detector_checkpoint": str(detector),
+                    "pose_checkpoint": str(pose) if pose else None,
+                },
                 status="queued",
                 phase="Đang chờ",
                 frames=0,
@@ -614,18 +664,16 @@ def create_app(  # noqa: PLR0915 -- route registration for a small local applica
     def youtube():
         try:
             url = youtube_url(request.form.get("url", ""))
-            max_seconds = live_seconds_setting(request.form)
-            confidence, preprocessing, image_size = inference_settings(request.form)
-            min_height = min_height_setting(request.form)
+            confidence, image_size = inference_settings(request.form)
         except ValueError as exc:
             return jsonify(error=str(exc)), 400
         return enqueue(
             confidence,
-            preprocessing,
+            PREPROCESSING,
             image_size,
-            min_height,
+            LIVE_MIN_HEIGHT,
             source_url=url,
-            max_seconds=max_seconds,
+            max_seconds=LIVE_SECONDS,
         )
 
     @app.post("/api/jobs/<job_id>/stop")
@@ -746,11 +794,29 @@ def main():
         help="YOLO .pt, or a TensorRT .engine exported at 384x640",
     )
     parser.add_argument("--ocr-checkpoint", type=Path, default=DEFAULT_OCR)
+    parser.add_argument(
+        "--pose",
+        type=Path,
+        default=DEFAULT_POSE,
+        help="YOLOv8-pose corner model; straightened crops are read when it finds the plate",
+    )
+    parser.add_argument("--no-pose", action="store_true", help="Read detector crops only")
+    parser.add_argument(
+        "--no-openvino",
+        action="store_true",
+        help="On CPU, run the .pt files even when a *_openvino_model export sits next to them",
+    )
     args = parser.parse_args()
-    for path in (args.detector, args.ocr_checkpoint):
-        if not path.is_file():
+    pose = None if args.no_pose else args.pose
+    for path in (args.detector, args.ocr_checkpoint, pose):
+        if path is not None and not path.is_file():
             parser.error(f"Checkpoint not found: {path}")
-    create_app(args.detector, args.ocr_checkpoint, args.device).run(
+    detector = args.detector
+    # OpenVINO runs on the CPU; on CUDA/MPS the .pt files are faster.
+    if not args.no_openvino and resolve_device(args.device)[0].type == "cpu":
+        detector, pose = prefer_openvino(detector), prefer_openvino(pose)
+    print(f"Detector: {detector}\nPose: {pose}")
+    create_app(detector, args.ocr_checkpoint, args.device, pose=pose).run(
         host=args.host, port=args.port, threaded=True, use_reloader=False
     )
 

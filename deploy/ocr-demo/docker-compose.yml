@@ -9,9 +9,13 @@ services:
     # Reached by the shared nginx VM (<NGINX_VM_IP>) over the LAN.
     ports:
       - "8766:8766"
-    # Shares the LXC with saigondepot and vietjobs-demo; cap it so a long clip cannot starve them.
-    mem_limit: 2g
-    cpus: 2
+    # Uses all 12 CPUs of the 8 GB LXC it shares with saigondepot and vietjobs-demo. 2 GB was OOM-killed
+    # on a 1080p livestream; torch threads must match cpus or 12 threads thrash on the quota.
+    mem_limit: 4g
+    cpus: 12
+    environment:
+      OMP_NUM_THREADS: "12"
+      MKL_NUM_THREADS: "12"
     volumes:
       - outputs:/app/custom_alpr/outputs/web-demo
 
